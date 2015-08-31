@@ -10,6 +10,7 @@ from ..storage.memory import SimMemory
 from ..storage.paged_memory import SimPagedMemory
 from ..storage.memory_object import SimMemoryObject
 
+DEFAULT_MAX_SEARCH = 8
 
 class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
     _CONCRETIZATION_STRATEGIES = [ 'symbolic', 'any', 'max', 'symbolic_nonzero', 'norepeats' ]
@@ -285,7 +286,7 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
 
         # for now, we always load the maximum size
         _,max_size = self._symbolic_size_range(size)
-        if options.ABSTRACT_MEMORY not in self.state.options:
+        if options.ABSTRACT_MEMORY not in self.state.options and self.state.se.symbolic(size):
             self.state.add_constraints(size == max_size, action=True)
         size = self.state.se.BVV(max_size, self.state.arch.bits)
 
@@ -313,17 +314,22 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
             constraint_options.append(dst == a)
 
         if len(constraint_options) > 1:
-            load_constraint = self.state.se.Or(*constraint_options)
+            load_constraint = [ self.state.se.Or(*constraint_options) ]
+        elif not self.state.se.symbolic(constraint_options[0]):
+            load_constraint = [ ]
         else:
-            load_constraint = constraint_options[0]
+            load_constraint = [ constraint_options[0] ]
 
         if condition is not None:
             read_value = self.state.se.If(condition, read_value, fallback)
-            load_constraint = self.state.se.Or(self.state.se.And(condition, load_constraint), self.state.se.Not(condition))
+            load_constraint = [ self.state.se.Or(self.state.se.And(condition, *load_constraint), self.state.se.Not(condition)) ]
 
-        return addrs, read_value, [ load_constraint ]
+        return addrs, read_value, load_constraint
 
     def _find(self, start, what, max_search=None, max_symbolic_bytes=None, default=None):
+        if max_search is None:
+            max_search = DEFAULT_MAX_SEARCH
+
         if isinstance(start, (int, long)):
             start = self.state.BVV(start, self.state.arch.bits)
 
@@ -334,12 +340,13 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         l.debug("Search for %d bytes in a max of %d...", seek_size, max_search)
 
         preload = True
-        all_memory = self.state.memory.load(start, max_search, endness="Iend_BE")
+        all_memory = self.load(start, max_search, endness="Iend_BE")
         if all_memory.symbolic:
             preload = False
 
         cases = [ ]
         match_indices = [ ]
+        offsets_matched = [ ] # Only used in static mode
         for i in itertools.count():
             l.debug("... checking offset %d", i)
             if i > max_search - seek_size:
@@ -352,27 +359,68 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
             if preload:
                 b = all_memory[max_search*8 - i*8 - 1 : max_search*8 - i*8 - seek_size*8]
             else:
-                b = self.state.memory.load(start + i, seek_size, endness="Iend_BE")
-            cases.append([ b == what, start + i ])
+                b = self.load(start + i, seek_size, endness="Iend_BE")
+            cases.append([b == what, start + i])
             match_indices.append(i)
 
-            if not b.symbolic and not symbolic_what:
-                #print "... checking", b, 'against', what
-                if self.state.se.any_int(b) == self.state.se.any_int(what):
-                    l.debug("... found concrete")
-                    break
+            if self.state.mode == 'static':
+                # In static mode, nothing is symbolic
+                if isinstance(b.model, claripy.vsa.StridedInterval):
+                    si = b
+
+                    if not si.intersection(what).model.is_empty:
+                        offsets_matched.append(start + i)
+
+                    if si.identical(what):
+                        break
+
+                    if si.model.cardinality != 1:
+                        if remaining_symbolic is not None:
+                            remaining_symbolic -= 1
+
+                elif type(b.model) in (claripy.bv.BVV, int, long):
+                    si = claripy.SI(bits=8, to_conv=b.model)
+
+                    if not si.intersection(what).model.is_empty:
+                        offsets_matched.append(start + i)
+
+                    if si.identical(what):
+                        break
+
+                else:
+                    # Comparison with other types (like IfProxy or ValueSet) is not supported
+                    if remaining_symbolic is not None:
+                        remaining_symbolic -= 1
+
             else:
-                if remaining_symbolic is not None:
-                    remaining_symbolic -= 1
+                # other modes (e.g. symbolic mode)
+                if not b.symbolic and not symbolic_what:
+                    #print "... checking", b, 'against', what
+                    if self.state.se.any_int(b) == self.state.se.any_int(what):
+                        l.debug("... found concrete")
+                        break
+                else:
+                    if remaining_symbolic is not None:
+                        remaining_symbolic -= 1
 
-        if default is None:
-            l.debug("... no default specified")
-            default = 0
-            constraints += [ self.state.se.Or(*[ c for c,_ in cases]) ]
+        if self.state.mode == 'static':
 
-        #l.debug("running ite_cases %s, %s", cases, default)
-        r = self.state.se.ite_cases(cases, default)
-        return r, constraints, match_indices
+            r = self.state.se.ESI(self.state.arch.bits)
+            for off in offsets_matched:
+                r = r.union(off)
+
+            constraints = [ ]
+            return r, constraints, match_indices # TODO: Should we return match_indices?
+
+        else:
+            if default is None:
+                l.debug("... no default specified")
+                default = 0
+                constraints += [ self.state.se.Or(*[ c for c,_ in cases]) ]
+
+            #l.debug("running ite_cases %s, %s", cases, default)
+            r = self.state.se.ite_cases(cases, default)
+            return r, constraints, match_indices
 
     def __contains__(self, dst):
         if isinstance(dst, (int, long)):
@@ -511,7 +559,17 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         req.completed = True
         return req
 
-    def store_with_merge(self, dst, cnt, size=None, condition=None, fallback=None): #pylint:disable=unused-argument
+    def _store_with_merge(self, req):
+
+        dst = req.addr
+        cnt = req.data
+        size = req.size
+
+        req.stored_values = [ ]
+        req.simplified_values = [ ]
+        req.symbolic_sized_values = [ ]
+        req.conditional_values = [ ]
+
         if options.ABSTRACT_MEMORY not in self.state.options:
             raise SimMemoryError('store_with_merge is not supported without abstract memory.')
 
@@ -542,7 +600,7 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
                 return False
 
             def can_be_reversed(o):
-                if isinstance(o, claripy.Bits) and (isinstance(o.model, claripy.bv.BVV) or \
+                if isinstance(o, claripy.Bits) and (isinstance(o.model, claripy.bv.BVV) or
                                      (isinstance(o.model, claripy.vsa.StridedInterval) and o.model.is_integer)):
                     return True
                 return False
@@ -567,7 +625,15 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
             # Write the new value
             self.store(addr, merged_val, size=size)
 
-        return []
+            req.stored_values.append(merged_val)
+
+        req.completed = True
+
+        # TODO: revisit the following lines
+        req.fallback_values = [ ]
+        req.constraints = [ ]
+
+        return req
 
     # Return a copy of the SimMemory
     def copy(self):
@@ -577,7 +643,8 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
                               repeat_min=self._repeat_min,
                               repeat_constraints=self._repeat_constraints,
                               repeat_expr=self._repeat_expr,
-                              endness=self.endness)
+                              endness=self.endness,
+                              abstract_backer=self._abstract_backer)
         return c
 
     def get_unconstrained_bytes(self, name, bits):
