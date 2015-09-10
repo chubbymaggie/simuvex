@@ -1,8 +1,10 @@
 from collections import namedtuple
 
 from .plugin import SimStatePlugin
-from ..storage.file import SimSymbolicFile
+from ..storage.file import SimFile
 
+import os
+import simuvex
 import logging
 l = logging.getLogger('simuvex.plugins.posix')
 
@@ -16,8 +18,9 @@ Stat = namedtuple('Stat', ('st_dev', 'st_ino', 'st_nlink', 'st_mode', 'st_uid',
 class SimStateSystem(SimStatePlugin):
     #__slots__ = [ 'maximum_symbolic_syscalls', 'files', 'max_length' ]
 
-    def __init__(self, initialize=True, files=None, sockets=None, pcap_backer=None, inetd=False,
-                 argv=None, argc=None, environ=None, auxv=None, tls_modules=None, fs=None):
+    def __init__(self, initialize=True, files=None, concrete_fs=False, chroot=None, sockets=None,
+            pcap_backer=None, inetd=False, argv=None, argc=None, environ=None, auxv=None, tls_modules=None,
+            fs=None):
         SimStatePlugin.__init__(self)
         self.maximum_symbolic_syscalls = 255
         self.files = { } if files is None else files
@@ -30,6 +33,8 @@ class SimStateSystem(SimStatePlugin):
         self.argv = argv
         self.environ = environ
         self.auxv = auxv
+        self.concrete_fs = concrete_fs
+        self.chroot = chroot
         self.tls_modules = tls_modules if tls_modules is not None else {}
 
         if initialize:
@@ -38,9 +43,9 @@ class SimStateSystem(SimStatePlugin):
                 self.open("inetd", "r")
                 self.add_socket(0)
             else:
-                self.open("/dev/stdin", "r") # stdin
-            self.open("/dev/stdout", "w") # stdout
-            self.open("/dev/stderr", "w") # stderr
+                self.open("/dev/stdin", "r", force_symbolic=True) # stdin
+            self.open("/dev/stdout", "w", force_symbolic=True) # stdout
+            self.open("/dev/stderr", "w", force_symbolic=True) # stderr
         else:
             if len(self.files) == 0:
                 l.debug("Not initializing files...")
@@ -65,7 +70,15 @@ class SimStateSystem(SimStatePlugin):
             if self.state is not f.state:
                 raise SimError("states somehow differ")
 
-    def open(self, name, mode, preferred_fd=None):
+    def open(self, name, mode, preferred_fd=None, force_symbolic=False):
+        '''
+        open a file
+
+        :param name: name of the file
+        :param mode: file operation mode
+        :param preferred_fd: assign this fd if it's not already claimed
+        :param force_symbolic: open the file as a SymbolicFile even if concrete_fs is enabled
+        '''
         # TODO: speed this up
         fd = None
         if preferred_fd is not None and preferred_fd not in self.files:
@@ -79,9 +92,35 @@ class SimStateSystem(SimStatePlugin):
             raise SimPosixError('exhausted file descriptors')
 
         if name in self.fs:
-            f = self.fs[name].copy()
+            # we assume we don't need to copy the file object, the file has been created just for
+            # us to use
+            f = self.fs[name]
+        elif self.concrete_fs and not force_symbolic:
+            # if we're in a chroot update the name
+            if self.chroot is not None:
+                # this is NOT a secure implementation of chroot, it is only for convenience
+                name = self._chrootize(name)
+
+            # create the backing
+            backing = SimSymbolicMemory(memory_id="file_%s" % name)
+            backing.set_state(self.state)
+
+            # if we're in read mode get the file contents
+            if not isinstance(mode, (int, long)):
+                mode = self.state.se.any_int(mode)
+            if mode == simuvex.storage.file.Flags.O_RDONLY or (mode & simuvex.storage.file.Flags.O_RDWR):
+                try:
+                    with open(name, "r") as fp:
+                        content = fp.read()
+                except IOError: # if the file doesn't exist return error
+                    return -1
+                cbvv = self.state.BVV(content)
+                backing.store(0, cbvv)
+                f = SimFile(name, mode, content=backing, size=len(content))
+            else:
+                f = SimFile(name, mode)
         else:
-            f = SimSymbolicFile(name, mode)
+            f = SimFile(name, mode)
         if self.state is not None:
             f.set_state(self.state)
 
@@ -89,14 +128,17 @@ class SimStateSystem(SimStatePlugin):
 
         return fd
 
-    def read(self, fd, length, pos=None, dst_addr=None):
+    def read(self, fd, dst_addr, length):
         # TODO: error handling
         # TODO: symbolic support
-        return self.get_file(fd).read(length, pos, dst_addr=dst_addr)
+        return self.get_file(fd).read(dst_addr, length)
 
-    def write(self, fd, content, length, pos=None):
+    def read_from(self, fd, length):
+        return self.get_file(fd).read_from(length)
+
+    def write(self, fd, content, length):
         # TODO: error handling
-        self.get_file(fd).write(content, length, pos)
+        self.get_file(fd).write(content, length)
         return length
 
     def close(self, fd):
@@ -155,7 +197,7 @@ class SimStateSystem(SimStatePlugin):
             if f in self.sockets:
                 sockets[f] = files[f]
 
-        return SimStateSystem(initialize=False, files=files, sockets=sockets, pcap_backer=self.pcap, argv=self.argv, argc=self.argc, environ=self.environ, auxv=self.auxv, tls_modules=self.tls_modules, fs=self.fs)
+        return SimStateSystem(initialize=False, files=files, concrete_fs=self.concrete_fs, chroot=self.chroot, sockets=sockets, pcap_backer=self.pcap, argv=self.argv, argc=self.argc, environ=self.environ, auxv=self.auxv, tls_modules=self.tls_modules, fs=self.fs)
 
     def merge(self, others, merge_flag, flag_values):
         all_files = set.union(*(set(o.files.keys()) for o in [ self ] + others))
@@ -176,7 +218,8 @@ class SimStateSystem(SimStatePlugin):
         return self.state.se.any_str(self.get_file(fd).all_bytes())
 
     def dump(self, fd, filename):
-        open(filename, "w").write(self.dumps(fd))
+        with open(filename, "w") as f:
+            f.write(self.dumps(fd))
 
     def get_file(self, fd):
         fd = self.state.make_concrete_int(fd)
@@ -185,6 +228,33 @@ class SimStateSystem(SimStatePlugin):
             self.open("tmp_%d" % fd, "wr", preferred_fd=fd)
         return self.files[fd]
 
+    def _chrootize(self, name):
+        '''
+        take a path and make sure if fits within the chroot
+        remove '../', './', and '/' from the beginning of path
+        '''
+        normalized = os.path.normpath(os.path.abspath(name))
+
+        # if it starts with the chroot after absolution and normalization it's good
+        if normalized.startswith(self.chroot):
+            return normalized
+
+        normalized = os.path.normpath(name)
+        # otherwise we trim the path and append it to the chroot
+        while True:
+            if normalized.startswith("/"):
+                normalized = normalized[1:]
+            elif normalized.startswith("./"):
+                normalized = normalized[2:]
+            elif normalized.startswith("../"):
+                normalized = normalized[3:]
+            else:
+                break
+
+        return os.path.join(self.chroot, normalized)
+
+
 SimStatePlugin.register_default('posix', SimStateSystem)
 
+from ..plugins.symbolic_memory import SimSymbolicMemory
 from ..s_errors import SimPosixError, SimError
