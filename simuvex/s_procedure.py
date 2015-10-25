@@ -2,6 +2,7 @@
 
 import inspect
 import itertools
+import pyvex
 
 import logging
 l = logging.getLogger(name = "simuvex.s_procedure")
@@ -39,6 +40,12 @@ class SimProcedure(SimRun):
         self.cc = None
         self.set_convention(convention)
 
+        # NO_RET flag, for overriding the default NO_RET flag set by the SimProcedure itself
+        # None - no overriding, respect the default flag
+        # True - the same as NO_RET == True
+        # Fasle - the same as NO_RET == False
+        self.overriding_no_ret = None
+
         # prepare and run!
         if o.AUTO_REFS not in self.state.options:
             cleanup_options = True
@@ -54,7 +61,8 @@ class SimProcedure(SimRun):
         run_func = getattr(self, run_func_name)
         r = run_func(*args, **self.kwargs)
 
-        if r is not None:
+        if (self.overriding_no_ret is False) or \
+                (self.overriding_no_ret is None and not self.NO_RET):
             self.ret(r)
 
         if o.FRESHNESS_ANALYSIS in self.state.options:
@@ -152,7 +160,7 @@ class SimProcedure(SimRun):
                 self.state.options.discard(o.AST_DEPS)
                 self.state.options.discard(o.AUTO_REFS)
 
-            ret_irsb = self.state.arch.disassemble_vex(self.state.arch.ret_instruction, mem_addr=self.addr)
+            ret_irsb = pyvex.IRSB(arch=self.state.arch, bytes=self.state.arch.ret_instruction, mem_addr=self.addr)
             ret_simirsb = SimIRSB(self.state, ret_irsb, inline=True, addr=self.addr)
             if not ret_simirsb.flat_successors + ret_simirsb.unsat_successors:
                 ret_state = ret_simirsb.default_exit

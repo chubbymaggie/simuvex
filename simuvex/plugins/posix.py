@@ -174,9 +174,53 @@ class SimStateSystem(SimStatePlugin):
                     self.state.se.BVV(0, 64), # st_ctime
                     self.state.se.BVV(0, 64)) # st_ctimensec
 
-    def seek(self, fd, seek):
+    def seek(self, fd, seek, whence):
         # TODO: symbolic support?
-        self.get_file(fd).seek(seek)
+
+        if self.state.se.symbolic(fd):
+            l.error("Symbolic file descriptor is not supported in seek().")
+            raise SimPosixError('Symbolic file descriptor is not supported in seek()')
+
+        fd = self.state.se.any_int(fd)
+
+        if fd in (0, 1, 2):
+            # We can't seek in stdin, stdout or stderr
+            # TODO: set errno
+            l.error('stdin/stdout/stderr is not seekable.')
+            return -1
+
+        f = self.get_file(fd)
+
+        if whence == 0:
+            # SEEK_SET
+            f.seek(seek)
+            return 0
+
+        elif whence == 1:
+            # SEEK_CUR
+            new_pos = f.pos + seek
+
+            f.seek(new_pos)
+            return 0
+
+        else: # whence == 2
+            # SEEK_END
+            size = f.size
+            if size is None:
+                # The file is not seekable
+                l.error('File with fd %d is not seekable.', fd)
+                return -1
+            f.seek(size - seek)
+            return 0
+
+    def set_pos(self, fd, pos):
+        """
+        Set current position of the file. fd can be anything, including stdin/stdout/stderr
+
+        :param fd: The file descriptor
+        """
+
+        self.get_file(fd).seek(pos)
 
     def pos(self, fd):
         # TODO: symbolic support?
