@@ -24,14 +24,9 @@ class SimPagedMemory(collections.MutableMapping):
         self._updated_mappings = set()
 
     def __getstate__(self):
-        import pickle
-        try:
-            pickle.dumps(self._pages)
-        except TypeError:
-            __import__('ipdb').set_trace()
         return {
-            # '_backer': self._backer,
-            # '_pages': self._pages,
+            '_backer': self._backer,
+            '_pages': self._pages,
             '_page_size': self._page_size,
             'state': self.state,
             '_name_mapping': self._name_mapping,
@@ -164,9 +159,9 @@ class SimPagedMemory(collections.MutableMapping):
                     other[c] = SimMemoryObject(self.state.se.BVV(ord(other[c]), 8), c)
                 if c in self and self[c] != other[c]:
                     # Try to see if the bytes are equal
-                    self_byte = self[c].bytes_at(c, 1).model
-                    other_byte = other[c].bytes_at(c, 1).model
-                    if not self.state.se.is_true(self_byte == other_byte):
+                    self_byte = self[c].bytes_at(c, 1)
+                    other_byte = other[c].bytes_at(c, 1)
+                    if not self_byte is other_byte:
                         #l.debug("%s: offset %x, two different bytes %s %s from %s %s", self.id, c,
                         #       self_byte, other_byte,
                         #       self[c].object.model, other[c].object.model)
@@ -225,12 +220,36 @@ class SimPagedMemory(collections.MutableMapping):
         if len(old.variables) == 0:
             raise SimMemoryError("old argument to replace_all() must have at least one named variable")
 
-        memory_objects = set()
+        # Compute an intersection between sets of memory objects for each unique variable name. The eventual memory
+        # object set contains all memory objects that we should update.
+        memory_objects = None
         for v in old.variables:
-            memory_objects.update(self.memory_objects_for_name(v))
+            if memory_objects is None:
+                memory_objects = self.memory_objects_for_name(v)
+            elif len(memory_objects) == 0:
+                # It's a set and it's already empty
+                # there is no way for it to go back...
+                break
+            else:
+                memory_objects &= self.memory_objects_for_name(v)
 
+        replaced_objects_cache = { }
         for mo in memory_objects:
-            self.replace_memory_object(mo, mo.object.replace(old, new))
+            replaced_object = None
+
+            if mo.object in replaced_objects_cache:
+                if mo.object is not replaced_objects_cache[mo.object]:
+                    replaced_object = replaced_objects_cache[mo.object]
+
+            else:
+                replaced_object = mo.object.replace(old, new)
+                replaced_objects_cache[mo.object] = replaced_object
+                if mo.object is replaced_object:
+                    # The replace does not really occur
+                    replaced_object = None
+
+            if replaced_object is not None:
+                self.replace_memory_object(mo, replaced_object)
 
     #
     # Mapping bullshit

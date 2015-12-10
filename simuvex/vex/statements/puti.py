@@ -22,7 +22,7 @@ class SimIRStmt_PutI(SimIRStmt):
 
         if o.FRESHNESS_ANALYSIS in self.state.options:
             var = SimRegisterVariable(self.offset, expr.size() / 8)
-            self.state.scratch.used_variables.add(var)
+            self.state.scratch.used_variables.add_register_variable(var)
 
         # track the put
         if o.TRACK_REGISTER_ACTIONS in self.state.options:
@@ -30,6 +30,8 @@ class SimIRStmt_PutI(SimIRStmt):
             size_ao = SimActionObject(data.size_bits())
             a = SimActionData(self.state, SimActionData.REG, SimActionData.WRITE, addr=self.offset, data=data_ao, size=size_ao)
             self.actions.append(a)
+        else:
+            a = None
 
         # do the put (if we should)
         if o.DO_PUTS in self.state.options:

@@ -52,7 +52,7 @@ class FormatString(object):
         for component in self.components:
             # if this is just concrete data
             if isinstance(component, str):
-                string = self._add_to_string(string, self.parser.state.BVV(component))
+                string = self._add_to_string(string, self.parser.state.se.BVV(component))
             else:
                 # okay now for the interesting stuff
                 # what type of format specifier is it?
@@ -83,7 +83,7 @@ class FormatString(object):
                     else:
                         raise SimProcedureError("Unimplemented format specifier '%s'" % fmt_spec.spec_type)
 
-                    string = self._add_to_string(string, self.parser.state.BVV(s_val))
+                    string = self._add_to_string(string, self.parser.state.se.BVV(s_val))
 
                 argpos += 1
 
@@ -101,8 +101,8 @@ class FormatString(object):
             region = self.parser.state.memory
 
         bits = self.parser.state.arch.bits
-        failed = self.parser.state.BVV(0, bits)
-        argpos = startpos
+        failed = self.parser.state.se.BVV(0, bits)
+        argpos = startpos 
         position = addr
         for component in self.components:
             if isinstance(component, str):
@@ -123,7 +123,7 @@ class FormatString(object):
                         max_sym_bytes = fmt_spec.length_spec
 
                     # TODO: look for limits on other characters which scanf is sensitive to, '\x00', '\x20'
-                    ohr, ohc, ohi = region.find(position, self.parser.state.BVV('\n', 8), max_str_len, max_symbolic_bytes=max_sym_bytes)
+                    ohr, ohc, ohi = region.find(position, self.parser.state.se.BVV('\n'), max_str_len, max_symbolic_bytes=max_sym_bytes)
 
                     # if no newline is found, mm is position + max_strlen
                     # If-branch will really only happen for format specifiers with a length
@@ -135,14 +135,14 @@ class FormatString(object):
                     # TODO all of these should be delimiters we search for above
                     # add that the contents of the string cannot be any scanf %s string delimiters
                     for delimiter in FormatString.SCANF_DELIMITERS:
-                        delim_bvv = self.parser.state.BVV(delimiter)
+                        delim_bvv = self.parser.state.se.BVV(delimiter)
                         for i in range(length):
                             self.parser.state.add_constraints(region.load(position + i, 1) != delim_bvv)
 
                     # write it out to the pointer
                     self.parser.state.memory.store(dest, src_str)
                     # store the terminating null byte
-                    self.parser.state.memory.store(dest + length, self.parser.state.BVV(0, 8))
+                    self.parser.state.memory.store(dest + length, self.parser.state.se.BVV(0, 8))
 
                     position += length
 
@@ -150,7 +150,7 @@ class FormatString(object):
 
                     # XXX: atoi only supports strings of one byte
                     if fmt_spec.spec_type == 'd' or fmt_spec.spec_type == 'u':
-                        status, i = self.parser._sim_atoi_inner(position, region)
+                        status, i, _ = self.parser._sim_atoi_inner(position, region)
                         # increase failed count if we were unable to parse it
                         failed = self.parser.state.se.If(status, failed, failed + 1)
                         position += 1
@@ -325,11 +325,16 @@ class FormatParser(SimProcedure):
                 nugget = nugget[:len(spec)]
                 original_nugget = original_nugget[:(length_spec_str_len + len(spec))]
                 nugtype = all_spec[nugget]
+                typeobj = None
                 if nugtype in simuvex.s_type.ALL_TYPES:
                     typeobj = simuvex.s_type.ALL_TYPES[nugtype](self.state.arch)
-                elif nugtype in simuvex.s_type._C_TYPE_TO_SIMTYPE:
-                    typeobj = simuvex.s_type._C_TYPE_TO_SIMTYPE[nugtype](self.state.arch)
                 else:
+                    # we have to loop through these since the keys are tuples
+                    for k, v in simuvex.s_type._C_TYPE_TO_SIMTYPE.items():
+                        if nugtype in k:
+                            typeobj = v(self.state.arch)
+                            break
+                if typeobj is None:
                     raise SimProcedureError("format specifier uses unknown type '%s'" % repr(nugtype))
                 return FormatSpecifier(original_nugget, length_spec, typeobj.size / 8, typeobj.signed)
 
@@ -371,9 +376,10 @@ class FormatParser(SimProcedure):
         Return the result of invoking the atoi simprocedure on str_addr
         """
 
-        atoi = simuvex.SimProcedures['libc.so.6']['atoi']
+        strtol = simuvex.SimProcedures['libc.so.6']['strtol']
 
-        return atoi._atoi_inner(str_addr, self.state, region)
+        return strtol.strtol_inner(str_addr, self.state, self.state.memory, 10, True)
+
 
     def _sim_strlen(self, str_addr):
         """
