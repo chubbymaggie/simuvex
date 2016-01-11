@@ -108,18 +108,18 @@ class SimSolver(SimStatePlugin):
             return self._stored_solver
 
         if o.ABSTRACT_SOLVER in self.state.options:
-            self._stored_solver = claripy.LightFrontend(claripy.backend_vsa, cache=False)
+            self._stored_solver = claripy.LightFrontend(claripy.backends.vsa, cache=False)
         elif o.REPLACEMENT_SOLVER in self.state.options:
-            self._stored_solver = claripy.ReplacementFrontend(claripy.FullFrontend(claripy.backend_z3), unsafe_replacement=True)
+            self._stored_solver = claripy.ReplacementFrontend(claripy.FullFrontend(claripy.backends.z3), unsafe_replacement=True)
         elif o.COMPOSITE_SOLVER in self.state.options:
-            self._stored_solver = claripy.CompositeFrontend(claripy.HybridFrontend(claripy.backend_z3))
+            self._stored_solver = claripy.CompositeFrontend(claripy.HybridFrontend(claripy.backends.z3))
         elif o.SYMBOLIC in self.state.options:
             if o.approximation & self.state.options:
-                self._stored_solver = claripy.HybridFrontend(claripy.backend_z3)
+                self._stored_solver = claripy.HybridFrontend(claripy.backends.z3)
             else:
-                self._stored_solver = claripy.FullFrontend(claripy.backend_z3)
+                self._stored_solver = claripy.FullFrontend(claripy.backends.z3)
         else:
-            self._stored_solver = claripy.LightFrontend(claripy.backend_concrete)
+            self._stored_solver = claripy.LightFrontend(claripy.backends.concrete)
 
         return self._stored_solver
 
@@ -159,7 +159,7 @@ class SimSolver(SimStatePlugin):
             return f
 
     def __dir__(self):
-        return sorted(set(dir(super(SimSolver, self)) + dir(claripy._all_operations)))
+        return sorted(set(dir(super(SimSolver, self)) + dir(claripy._all_operations) + dir(self.__class__)))
 
     #
     # Branching stuff
