@@ -6,6 +6,7 @@ l = logging.getLogger("simuvex.plugins.inspect")
 event_types = {
     'mem_read',
     'mem_write',
+    'address_concretization',
     'reg_read',
     'reg_write',
     'tmp_read',
@@ -58,10 +59,20 @@ inspect_attributes = {
     'symbolic_name',
     'symbolic_size',
     'symbolic_expr',
+
+    'address_concretization_strategy',
+    'address_concretization_limit',
+    'address_concretization_approx_limit',
+    'address_concretization_action',
+    'address_concretization_memory_id',
+    'address_concretization_expr',
+    'address_concretization_result',
+    'address_concretization_add_constraints',
     }
 
 BP_BEFORE = 'before'
 BP_AFTER = 'after'
+BP_BOTH = 'both'
 
 BP_IPDB = 'ipdb'
 BP_IPYTHON = 'ipython'
@@ -86,7 +97,7 @@ class BP(object):
         @param when: whether the check is happening before or after the event
         @returns boolean representing whether the checkpoint should fire
         '''
-        ok = self.enabled and when == self.when
+        ok = self.enabled and (when == self.when or self.when == BP_BOTH)
         if not ok:
             return ok
         l.debug("... after enabled and when: %s", ok)
@@ -146,6 +157,7 @@ from .plugin import SimStatePlugin
 class SimInspector(SimStatePlugin):
     BP_AFTER = BP_AFTER
     BP_BEFORE = BP_BEFORE
+    BP_BOTH = BP_BOTH
 
     def __init__(self):
         SimStatePlugin.__init__(self)
@@ -155,6 +167,9 @@ class SimInspector(SimStatePlugin):
 
         for i in inspect_attributes:
             setattr(self, i, None)
+
+    def __dir__(self):
+        return sorted(set(dir(super(SimInspector, self)) + dir(inspect_attributes) + dir(self.__class__)))
 
     def action(self, event_type, when, **kwargs):
         '''
