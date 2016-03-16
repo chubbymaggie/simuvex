@@ -112,10 +112,10 @@ class SimSolver(SimStatePlugin):
         elif o.REPLACEMENT_SOLVER in self.state.options:
             self._stored_solver = claripy.ReplacementFrontend(claripy.FullFrontend(claripy.backends.z3), unsafe_replacement=True)
         elif o.COMPOSITE_SOLVER in self.state.options:
-            self._stored_solver = claripy.CompositeFrontend(claripy.HybridFrontend(claripy.backends.z3))
+            self._stored_solver = claripy.CompositeFrontend(claripy.hybrid_vsa_z3())
         elif o.SYMBOLIC in self.state.options:
             if o.approximation & self.state.options:
-                self._stored_solver = claripy.HybridFrontend(claripy.backends.z3)
+                self._stored_solver = claripy.hybrid_vsa_z3()
             else:
                 self._stored_solver = claripy.FullFrontend(claripy.backends.z3)
         else:
@@ -290,12 +290,12 @@ class SimSolver(SimStatePlugin):
     def any_int(self, e, extra_constraints=()):
         ans = self.any_n_int(e, 1, extra_constraints=extra_constraints)
         if len(ans) > 0: return ans[0]
-        else: raise SimUnsatError("Not satisfiable")
+        else: raise SimUnsatError("Not satisfiable: %s" % e.shallow_repr())
 
     def any_str(self, e, extra_constraints=()):
         ans = self.any_n_str(e, 1, extra_constraints=extra_constraints)
         if len(ans) > 0: return ans[0]
-        else: raise SimUnsatError("Not satisfiable")
+        else: raise SimUnsatError("Not satisfiable: %s" % e.shallow_repr())
 
     def any_n_str_iter(self, e, n, extra_constraints=(), exact=None):
         for s in self.eval(e, n, extra_constraints=extra_constraints, exact=exact):

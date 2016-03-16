@@ -18,13 +18,58 @@ Stat = namedtuple('Stat', ('st_dev', 'st_ino', 'st_nlink', 'st_mode', 'st_uid',
 class SimStateSystem(SimStatePlugin):
     #__slots__ = [ 'maximum_symbolic_syscalls', 'files', 'max_length' ]
 
+    # some posix constants
+    SIG_BLOCK=0
+    SIG_UNBLOCK=1
+    SIG_SETMASK=2
+
+    EPERM      =     1 # /* Operation not permitted */
+    ENOENT     =     2 # /* No such file or directory */
+    ESRCH      =     3 # /* No such process */
+    EINTR      =     4 # /* Interrupted system call */
+    EIO        =     5 # /* I/O error */
+    ENXIO      =     6 # /* No such device or address */
+    E2BIG      =     7 # /* Argument list too long */
+    ENOEXEC    =     8 # /* Exec format error */
+    EBADF      =     9 # /* Bad file number */
+    ECHILD     =    10 # /* No child processes */
+    EAGAIN     =    11 # /* Try again */
+    ENOMEM     =    12 # /* Out of memory */
+    EACCES     =    13 # /* Permission denied */
+    EFAULT     =    14 # /* Bad address */
+    ENOTBLK    =    15 # /* Block device required */
+    EBUSY      =    16 # /* Device or resource busy */
+    EEXIST     =    17 # /* File exists */
+    EXDEV      =    18 # /* Cross-device link */
+    ENODEV     =    19 # /* No such device */
+    ENOTDIR    =    20 # /* Not a directory */
+    EISDIR     =    21 # /* Is a directory */
+    EINVAL     =    22 # /* Invalid argument */
+    ENFILE     =    23 # /* File table overflow */
+    EMFILE     =    24 # /* Too many open files */
+    ENOTTY     =    25 # /* Not a typewriter */
+    ETXTBSY    =    26 # /* Text file busy */
+    EFBIG      =    27 # /* File too large */
+    ENOSPC     =    28 # /* No space left on device */
+    ESPIPE     =    29 # /* Illegal seek */
+    EROFS      =    30 # /* Read-only file system */
+    EMLINK     =    31 # /* Too many links */
+    EPIPE      =    32 # /* Broken pipe */
+    EDOM       =    33 # /* Math argument out of domain of func */
+    ERANGE     =    34 # /* Math result not representable */
+
+
     def __init__(self, initialize=True, files=None, concrete_fs=False, chroot=None, sockets=None,
             pcap_backer=None, inetd=False, argv=None, argc=None, environ=None, auxv=None, tls_modules=None,
-            fs=None):
+            fs=None, queued_syscall_returns=None, sigmask=None, pid=None):
         SimStatePlugin.__init__(self)
+
+        # some limits and constants
+        self.sigmask_bits = 1024
         self.maximum_symbolic_syscalls = 255
-        self.files = { } if files is None else files
         self.max_length = 2 ** 16
+
+        self.files = { } if files is None else files
         self.sockets = {} if sockets is None else sockets
         self.pcap = None if pcap_backer is None else pcap_backer
         self.pflag = 0 if self.pcap is None else 1
@@ -36,6 +81,10 @@ class SimStateSystem(SimStatePlugin):
         self.concrete_fs = concrete_fs
         self.chroot = chroot
         self.tls_modules = tls_modules if tls_modules is not None else {}
+        self.queued_syscall_returns = [ ] if queued_syscall_returns is None else queued_syscall_returns
+        self.brk = None
+        self._sigmask = sigmask
+        self.pid = 1337 if pid is None else pid
 
         if initialize:
             l.debug("Initializing files...")
@@ -49,6 +98,11 @@ class SimStateSystem(SimStatePlugin):
         else:
             if len(self.files) == 0:
                 l.debug("Not initializing files...")
+
+    def set_brk(self, new_brk):
+        cur_brk = self.brk if self.brk is not None else self.state.se.BVV(0x1b00000, self.state.arch.bits)
+        self.brk = self.state.se.If(new_brk == 0, cur_brk, new_brk)
+        return self.brk
 
     #to keep track of sockets
     def add_socket(self, fd):
@@ -150,10 +204,11 @@ class SimStateSystem(SimStatePlugin):
             raise SimPosixError("Symbolic fd ?")
 
         fd = self.state.se.any_int(fd)
-        try:
-            del self.files[fd]
-        except KeyError:
-            l.error("Could not close fd 0x%x", fd)
+        retval = self.get_file(fd).close()
+
+        # Return this as a proper sized value for this arch
+        return self.state.se.BVV(retval, self.state.arch.bits)
+
 
     def fstat(self, fd): #pylint:disable=unused-argument
         # sizes are AMD64-specific for now
@@ -234,6 +289,47 @@ class SimStateSystem(SimStatePlugin):
 
         return None
 
+    def sigmask(self, sigsetsize=None):
+        """
+        Gets the current sigmask. If it's blank, a new one is created (of sigsetsize).
+
+        :param sigsetsize: the size (in *bytes* of the sigmask set)
+        :return: the sigmask
+        """
+        if self._sigmask is None:
+            if sigsetsize is not None:
+                sc = self.state.se.any_int(sigsetsize)
+                self.state.add_constraints(sc == sigsetsize)
+                self._sigmask = self.state.se.BVS('initial_sigmask', sc*8)
+            else:
+                self._sigmask = self.state.se.BVS('initial_sigmask', self.sigmask_bits)
+        return self._sigmask
+
+    def sigprocmask(self, how, new_mask, sigsetsize, valid_ptr=True):
+        """
+        Updates the signal mask.
+
+        :param how: the "how" argument of sigprocmask (see manpage)
+        :param new_mask: the mask modification to apply
+        :param sigsetsize: the size (in *bytes* of the sigmask set)
+        :param valid_ptr: is set if the new_mask was not NULL
+        """
+        oldmask = self.sigmask(sigsetsize)
+        self._sigmask = self.state.se.If(valid_ptr,
+            self.state.se.If(how == self.SIG_BLOCK,
+                oldmask | new_mask,
+                self.state.se.If(how == self.SIG_UNBLOCK,
+                    oldmask & (~new_mask),
+                    self.state.se.If(how == self.SIG_SETMASK,
+                        new_mask,
+                        oldmask
+                     )
+                )
+            ),
+            oldmask
+        )
+
+
     def copy(self):
         sockets = {}
         files = { fd:f.copy() for fd,f in self.files.iteritems() }
@@ -241,7 +337,7 @@ class SimStateSystem(SimStatePlugin):
             if f in self.sockets:
                 sockets[f] = files[f]
 
-        return SimStateSystem(initialize=False, files=files, concrete_fs=self.concrete_fs, chroot=self.chroot, sockets=sockets, pcap_backer=self.pcap, argv=self.argv, argc=self.argc, environ=self.environ, auxv=self.auxv, tls_modules=self.tls_modules, fs=self.fs)
+        return SimStateSystem(initialize=False, files=files, concrete_fs=self.concrete_fs, chroot=self.chroot, sockets=sockets, pcap_backer=self.pcap, argv=self.argv, argc=self.argc, environ=self.environ, auxv=self.auxv, tls_modules=self.tls_modules, fs=self.fs, queued_syscall_returns=list(self.queued_syscall_returns), sigmask=self._sigmask, pid=self.pid)
 
     def merge(self, others, merge_flag, flag_values):
         all_files = set.union(*(set(o.files.keys()) for o in [ self ] + others))
