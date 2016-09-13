@@ -10,14 +10,18 @@ l = logging.getLogger("simuvex.vex.irsb")
 
 import pyvex
 from ..s_run import SimRun
-#import vexecutor
+
 
 class IMark(object):
+    """
+    An IMark is an IR statement that indicates the address and length of the original instruction.
+    """
     def __init__(self, i):
         self.addr = i.addr
         self.len = i.len
 
 #pylint:disable=unidiomatic-typecheck
+
 
 class SimIRSB(SimRun):
     """
@@ -30,16 +34,17 @@ class SimIRSB(SimRun):
     :ivar last_stmt:        The statement to stop execution at.
     """
 
-    def __init__(self, state, irsb, irsb_id=None, whitelist=None, last_stmt=None, **kwargs):
+    def __init__(self, state, irsb, irsb_id=None, whitelist=None, last_stmt=None, force_bbl_addr=None, **kwargs):
         SimRun.__init__(self, state, **kwargs)
 
         if irsb.size == 0:
             raise SimIRSBError("Empty IRSB passed to SimIRSB.")
 
         self.irsb = irsb
-        self.first_imark = IMark([i for i in self.irsb.statements if type(i)==pyvex.IRStmt.IMark][0])
+        self.first_imark = IMark(next(i for i in self.irsb.statements if type(i) is pyvex.IRStmt.IMark))
         self.last_imark = self.first_imark
-        self.state.scratch.bbl_addr = self.addr
+        self.state.scratch.bbl_addr = self.addr if force_bbl_addr is None else force_bbl_addr
+        self.state.scratch.executed_block_count = 1
         self.state.sim_procedure = None
         self.id = "%x" % self.first_imark.addr if irsb_id is None else irsb_id
         self.whitelist = whitelist
@@ -60,7 +65,11 @@ class SimIRSB(SimRun):
         if o.BLOCK_SCOPE_CONSTRAINTS in self.state.options and 'solver_engine' in self.state.plugins:
             self.state.release_plugin('solver_engine')
 
-        self._handle_irsb()
+        try:
+            self._handle_irsb()
+        except SimError as e:
+            e.record_state(self.state)
+            raise
 
         # It's for debugging
         # irsb.pp()
@@ -106,19 +115,30 @@ class SimIRSB(SimRun):
         if self.has_default_exit:
             l.debug("%s adding default exit.", self)
 
-            self.next_expr = translate_expr(self.irsb.next, self.last_imark, self.num_stmts, self.state)
-            self.state.log.extend_actions(self.next_expr.actions)
+            try:
+                self.next_expr = translate_expr(self.irsb.next, self.last_imark, self.num_stmts, self.state)
 
-            if o.TRACK_JMP_ACTIONS in self.state.options:
-                target_ao = SimActionObject(self.next_expr.expr, reg_deps=self.next_expr.reg_deps(), tmp_deps=self.next_expr.tmp_deps())
-                self.state.log.add_action(SimActionExit(self.state, target_ao, exit_type=SimActionExit.DEFAULT))
+                self.state.log.extend_actions(self.next_expr.actions)
 
-            self.default_exit = self.add_successor(self.state, self.next_expr.expr, self.default_exit_guard,
-                                                   self.irsb.jumpkind, 'default')
+                if o.TRACK_JMP_ACTIONS in self.state.options:
+                    target_ao = SimActionObject(self.next_expr.expr, reg_deps=self.next_expr.reg_deps(), tmp_deps=self.next_expr.tmp_deps())
+                    self.state.log.add_action(SimActionExit(self.state, target_ao, exit_type=SimActionExit.DEFAULT))
 
-            if o.FRESHNESS_ANALYSIS in self.state.options:
-                # Note: only the default exit will have ignored_variables member.
-                self.default_exit.scratch.update_ignored_variables()
+                self.default_exit = self.add_successor(self.state, self.next_expr.expr, self.default_exit_guard,
+                                                       self.irsb.jumpkind, 'default')
+
+                if o.FRESHNESS_ANALYSIS in self.state.options:
+                    # Note: only the default exit will have ignored_variables member.
+                    self.default_exit.scratch.update_ignored_variables()
+
+            except KeyError:
+                # For some reason, the temporary variable that the successor relies on does not exist. It can be
+                # intentional (e.g. when executing a program slice)
+                # We save the current state anyways
+                self.unsat_successors.append(self.state)
+                self.default_exit = None
+
+                l.debug("The temporary variable for default exit of %s is missing.", self)
         else:
             l.debug("%s has no default exit", self)
 
@@ -135,15 +155,18 @@ class SimIRSB(SimRun):
             self.successors.append(exit_state)
 
         for exit_state in all_successors:
-            if o.CALLLESS in self.state.options and exit_state.scratch.jumpkind == "Ijk_Call":
-                exit_state.registers.store(exit_state.arch.ret_offset, exit_state.se.Unconstrained('fake_ret_value', exit_state.arch.bits))
+            exit_jumpkind = exit_state.scratch.jumpkind
+            if exit_jumpkind is None: exit_jumpkind = ""
 
+            if o.CALLLESS in self.state.options and exit_jumpkind == "Ijk_Call":
+                exit_state.registers.store(exit_state.arch.ret_offset,
+                                           exit_state.se.Unconstrained('fake_ret_value', exit_state.arch.bits))
                 exit_state.scratch.target = exit_state.se.BVV(self.addr + self.irsb.size, exit_state.arch.bits)
                 exit_state.scratch.jumpkind = "Ijk_Ret"
-
                 exit_state.regs.ip = exit_state.scratch.target
 
-            elif o.DO_RET_EMULATION in exit_state.options and exit_state.scratch.jumpkind == "Ijk_Call":
+            elif o.DO_RET_EMULATION in exit_state.options and \
+                    (exit_jumpkind == "Ijk_Call" or exit_jumpkind.startswith('Ijk_Sys')):
                 l.debug("%s adding postcall exit.", self)
 
                 ret_state = exit_state.copy()
@@ -151,7 +174,7 @@ class SimIRSB(SimRun):
                 target = ret_state.se.BVV(self.addr + self.irsb.size, ret_state.arch.bits)
                 if ret_state.arch.call_pushes_ret:
                     ret_state.regs.sp = ret_state.regs.sp + ret_state.arch.bytes
-                self.add_successor(ret_state, target, guard, 'Ijk_FakeRet')
+                self.add_successor(ret_state, target, guard, 'Ijk_FakeRet', exit_stmt_idx='default')
 
         if o.BREAK_SIRSB_END in self.state.options:
             import ipdb
@@ -187,11 +210,16 @@ class SimIRSB(SimRun):
 
             # we'll pass in the imark to the statements
             if type(stmt) == pyvex.IRStmt.IMark:
+                self.last_imark = IMark(stmt)
+                self.state.scratch.ins_addr = stmt.addr + stmt.delta
+
+                for subaddr in xrange(stmt.addr, stmt.addr + stmt.len):
+                    if subaddr in self.state.scratch.dirty_addrs:
+                        raise SimReliftException(self.state)
                 self.state._inspect('instruction', BP_AFTER)
 
-                l.debug("IMark: 0x%x", stmt.addr)
-                self.last_imark = IMark(stmt)
-                self.state.scratch.ins_addr = stmt.addr
+                l.debug("IMark: %#x", stmt.addr)
+                self.state.scratch.num_insns += 1
                 if o.INSTRUCTION_SCOPE_CONSTRAINTS in self.state.options:
                     if 'solver_engine' in self.state.plugins:
                         self.state.release_plugin('solver_engine')
@@ -236,8 +264,10 @@ class SimIRSB(SimRun):
                 state.scratch.temps[n] = self.state.se.Unconstrained('t%d_%s' % (n, self.id), size_bits(t))
             l.debug("%s prepared %d symbolic temps.", len(state.scratch.temps), self)
 
-    # Returns a list of instructions that are part of this block.
     def imark_addrs(self):
+        """
+        Returns a list of instructions that are part of this block.
+        """
         return [ i.addr for i in self.irsb.statements if type(i) == pyvex.IRStmt.IMark ]
 
     def reanalyze(self, mode=None, new_state=None, irsb_id=None, whitelist=None):
@@ -256,5 +286,5 @@ from .expressions import translate_expr
 from . import size_bits
 from .. import s_options as o
 from ..plugins.inspect import BP_AFTER, BP_BEFORE
-from ..s_errors import SimIRSBError, SimSolverError, SimMemoryAddressError
+from ..s_errors import SimError, SimIRSBError, SimSolverError, SimMemoryAddressError, SimReliftException
 from ..s_action import SimActionExit, SimActionObject

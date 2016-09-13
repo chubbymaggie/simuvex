@@ -1,7 +1,7 @@
 from .plugin import SimStatePlugin
 
-global heap_location
-heap_location = 0xc0000000
+HEAP_LOCATION = 0xc0000000
+HEAP_SIZE = 64*4096
 
 class SimStateLibc(SimStatePlugin):
     """
@@ -64,7 +64,8 @@ class SimStateLibc(SimStatePlugin):
         SimStatePlugin.__init__(self)
 
         # various thresholds
-        self.heap_location = heap_location
+        self.heap_location = HEAP_LOCATION
+        self.mmap_base = HEAP_LOCATION + HEAP_SIZE * 2
         self.buf_symbolic_bytes = 60
         self.max_symbolic_strstr = 1
         self.max_symbolic_strchr = 16
@@ -72,6 +73,7 @@ class SimStateLibc(SimStatePlugin):
         self.max_str_len = 128
         self.max_buffer_size = 48
         self.max_strtol_len = 10
+        self.max_memcpy_size = 4096
 
         # strtok
         self.strtok_heap = [ ]
@@ -91,6 +93,8 @@ class SimStateLibc(SimStatePlugin):
         # It will be initialized in __libc_start_main SimProcedure
         self.ctype_table_ptr = None
 
+        self._errno_location = None
+
     def copy(self):
         c = SimStateLibc()
         c.heap_location = self.heap_location
@@ -98,31 +102,46 @@ class SimStateLibc(SimStatePlugin):
         c.max_symbolic_strstr = self.max_symbolic_strstr
         c.max_symbolic_strchr = self.max_symbolic_strchr
         c.max_variable_size = self.max_variable_size
-        c.max_buffer_size = self.max_buffer_size
         c.max_str_len = self.max_str_len
+        c.max_buffer_size = self.max_buffer_size
+        c.max_strtol_len = self.max_strtol_len
+        c.max_memcpy_size = self.max_memcpy_size
         c.strtok_heap = self.strtok_heap[:]
         c.simple_strtok = self.simple_strtok
         c.strtok_token_size = self.strtok_token_size
         c.strdup_stack = self.strdup_stack[:]
         c.ppc64_abiv = self.ppc64_abiv
         c.ctype_table_ptr = self.ctype_table_ptr
+        c._errno_location = self._errno_location
         #c.aa = self.aa
 
         return c
 
-    def merge(self, others, merge_flag, flag_values):
-        merging_occured = False
-
+    def _combine(self, others):
         new_heap_location = max(o.heap_location for o in others)
         if self.heap_location != new_heap_location:
             self.heap_location = new_heap_location
-            merging_occured = True
+            return True
+        else:
+            return False
 
-        return merging_occured, [ ]
+    def merge(self, others, merge_conditions):
+        return self._combine(others)
 
-    def widen(self, others, merge_flag, flag_values):
+    def widen(self, others):
+        return self._combine(others)
 
-        # TODO: Recheck this function
-        return self.merge(others, merge_flag, flag_values)
+    def init_state(self):
+        if o.ABSTRACT_MEMORY in self.state.options:
+            return
+
+        try:
+            self.state.memory.permissions(HEAP_LOCATION)
+        except SimMemoryError:
+            self.state.memory.map_region(HEAP_LOCATION, 4096*64, 3)
+
 
 SimStatePlugin.register_default('libc', SimStateLibc)
+
+from ..s_errors import SimMemoryError
+from .. import s_options as o

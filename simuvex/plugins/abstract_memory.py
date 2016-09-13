@@ -3,13 +3,18 @@ import copy
 from itertools import count
 
 import claripy
+from claripy.vsa import ValueSet, RegionAnnotation
 
-from ..storage.memory import SimMemory, AddressWrapper
+from ..storage.memory import SimMemory, AddressWrapper, MemoryStoreRequest, RegionMap
+from ..s_errors import SimMemoryError
+from ..s_options import KEEP_MEMORY_READS_DISCRETE, AVOID_MULTIVALUED_READS
 from .symbolic_memory import SimSymbolicMemory
+from ..s_action_object import _raw_ast
 
 l = logging.getLogger("simuvex.plugins.abstract_memory")
 
 WRITE_TARGETS_LIMIT = 2048
+READ_TARGETS_LIMIT = 4096
 
 #pylint:disable=unidiomatic-typecheck
 
@@ -119,48 +124,41 @@ class MemoryRegion(object):
 
     def load(self, addr, size, bbl_addr, stmt_idx, ins_addr): #pylint:disable=unused-argument
         #if bbl_addr is not None and stmt_id is not None:
-        return self.memory.load(addr, size)
+        return self.memory.load(addr, size, inspect=False)
 
-    def merge(self, others, merge_flag, flag_values):
+    def _merge_alocs(self, other_region):
+        """
+        Helper function for merging.
+        """
         merging_occurred = False
-
-        for other_region in others:
-            # Merge alocs
-            for aloc_id, aloc in other_region.alocs.iteritems():
-                if aloc_id not in self.alocs:
-                    self.alocs[aloc_id] = aloc.copy()
-                    merging_occurred = True
-                else:
-                    # Update it
-                    merging_occurred |= self.alocs[aloc_id].merge(aloc)
-
-            # Merge memory
-            merging_result, _ = self.memory.merge([other_region.memory], merge_flag, flag_values)
-
-            merging_occurred |= merging_result
-
+        for aloc_id, aloc in other_region.alocs.iteritems():
+            if aloc_id not in self.alocs:
+                self.alocs[aloc_id] = aloc.copy()
+                merging_occurred = True
+            else:
+                # Update it
+                merging_occurred |= self.alocs[aloc_id].merge(aloc)
         return merging_occurred
 
-    def widen(self, others, merge_flag, flag_values):
-        widening_occurred = False
-
+    def merge(self, others, merge_conditions):
+        merging_occurred = False
         for other_region in others:
-            for aloc_id, aloc in other_region.alocs.iteritems():
-                if aloc_id not in self.alocs:
-                    self.alocs[aloc_id] = aloc.copy()
-                    widening_occurred = True
-                else:
-                    widening_occurred |= self.alocs[aloc_id].merge(aloc)
+            merging_occurred |= self._merge_alocs(other_region)
+            merging_occurred |= self.memory.merge([other_region.memory], merge_conditions)
+        return merging_occurred
 
-            # Widen the values inside memory
-            widening_result = self.memory.widen([ other_region.memory ], merge_flag, flag_values)
-
-            widening_occurred |= widening_result
-
+    def widen(self, others):
+        widening_occurred = False
+        for other_region in others:
+            widening_occurred |= self._merge_alocs(other_region)
+            widening_occurred |= self.memory.widen([ other_region.memory ])
         return widening_occurred
 
     def __contains__(self, addr):
         return addr in self.memory
+
+    def was_written_to(self, addr):
+        return self.memory.was_written_to(addr)
 
     def dbg_print(self, indent=0):
         """
@@ -185,7 +183,7 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
       calling unset_stack_address_mapping().
       Currently this is only used for stack!
     """
-    def __init__(self, backer=None, memory_id="mem", endness=None):
+    def __init__(self, memory_backer=None, memory_id="mem", endness=None):
         SimMemory.__init__(self, endness=endness)
 
         self._regions = {}
@@ -196,8 +194,8 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
         self._memory_id = memory_id
         self.id = self._memory_id
 
-        if backer is not None:
-            for region, backer_dict in backer.items():
+        if memory_backer is not None:
+            for region, backer_dict in memory_backer.items():
                 self._regions[region] = MemoryRegion(region, self.state,
                                                init_memory=True,
                                                backer_dict=backer_dict,
@@ -207,8 +205,52 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
     def regions(self):
         return self._regions
 
-    def stack_id(self, function_address): #pylint:disable=no-self-use
-        return 'stack_0x%x' % function_address
+    def _region_base(self, region):
+        """
+        Get the base address of a memory region.
+
+        :param str region: ID of the memory region
+        :return: Address of the memory region
+        :rtype: int
+        """
+
+        if region == 'global':
+            region_base_addr = 0
+        elif region.startswith('stack_'):
+            region_base_addr = self._stack_region_map.absolutize(region, 0)
+        else:
+            region_base_addr = self._generic_region_map.absolutize(region, 0)
+
+        return region_base_addr
+
+    def stack_id(self, function_address):
+        """
+        Return a memory region ID for a function. If the default region ID exists in the region mapping, an integer
+        will appended to the region name. In this way we can handle recursive function calls, or a function that
+        appears more than once in the call frame.
+
+        This also means that `stack_id()` should only be called when creating a new stack frame for a function. You are
+        not supposed to call this function every time you want to map a function address to a stack ID.
+
+        :param int function_address: Address of the function.
+        :return: ID of the new memory region.
+        :rtype; str
+        """
+
+        region_id = 'stack_0x%x' % function_address
+
+        # deduplication
+        region_ids = self._stack_region_map.region_ids
+        if region_id not in region_ids:
+            return region_id
+        else:
+            for i in xrange(0, 2000):
+                new_region_id = region_id + '_%d' % i
+                if new_region_id not in region_ids:
+                    return new_region_id
+            raise SimMemoryError('Cannot allocate region ID for function %#08x - recursion too deep' % function_address)
+
+
 
     def set_stack_size(self, size):
         self._stack_size = size
@@ -216,7 +258,7 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
     def set_stack_address_mapping(self, absolute_address, region_id, related_function_address=None):
         self._stack_region_map.map(absolute_address, region_id, related_function_address=related_function_address)
 
-    def unset_stack_address_mapping(self, absolute_address, region_id, function_address):
+    def unset_stack_address_mapping(self, absolute_address, region_id, function_address):  # pylint:disable=unused-argument
         self._stack_region_map.unmap_by_address(absolute_address)
 
     def _normalize_address(self, region_id, relative_address, target_region=None):
@@ -230,7 +272,7 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
         """
         if self._stack_region_map.is_empty and self._generic_region_map.is_empty:
             # We don't have any mapped region right now
-            return AddressWrapper(region_id, relative_address, False, None)
+            return AddressWrapper(region_id, 0, relative_address, False, None)
 
         # We wanna convert this address to an absolute address first
         if region_id.startswith('stack_'):
@@ -251,7 +293,9 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
                 target_region_id=target_region
             )
 
-            return AddressWrapper(new_region_id, new_relative_address, True, related_function_addr)
+            return AddressWrapper(new_region_id, self._region_base(new_region_id), new_relative_address, True,
+                                  related_function_addr
+                                  )
 
         else:
             new_region_id, new_relative_address, related_function_addr = self._generic_region_map.relativize(
@@ -259,7 +303,7 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
                 target_region_id=target_region
             )
 
-            return AddressWrapper(new_region_id, new_relative_address, False, None)
+            return AddressWrapper(new_region_id, self._region_base(new_region_id), new_relative_address, False, None)
 
     def set_state(self, state):
         """
@@ -287,18 +331,17 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
         if type(addr) in (int, long):
             addr = self.state.se.BVV(addr, self.state.arch.bits)
 
-        addr = addr._model_vsa
         addr_with_regions = self._normalize_address_type(addr)
         address_wrappers = [ ]
 
-        for region, addr_si in addr_with_regions.items():
+        for region, addr_si in addr_with_regions:
             if is_write:
                 concrete_addrs = addr_si.eval(WRITE_TARGETS_LIMIT)
                 if len(concrete_addrs) == WRITE_TARGETS_LIMIT:
                     self.state.log.add_event('mem', message='too many targets to write to. address = %s' % addr_si)
             else:
-                concrete_addrs = addr_si.eval(WRITE_TARGETS_LIMIT)
-                if len(concrete_addrs) == WRITE_TARGETS_LIMIT:
+                concrete_addrs = addr_si.eval(READ_TARGETS_LIMIT)
+                if len(concrete_addrs) == READ_TARGETS_LIMIT:
                     self.state.log.add_event('mem', message='too many targets to read from. address = %s' % addr_si)
 
             for c in concrete_addrs:
@@ -312,24 +355,28 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
             return address_wrappers
 
     def _normalize_address_type(self, addr): #pylint:disable=no-self-use
-        if isinstance(addr, claripy.bv.BVV):
-            # That's a global address
-            addr = claripy.vsa.ValueSet(region='global', bits=addr.bits, val=addr.value)
+        """
+        Convert address of different types to a list of mapping between region IDs and offsets (strided intervals).
 
-            return addr
-        elif isinstance(addr, claripy.vsa.StridedInterval):
-            l.warning('Converting an SI to address. This may implies an imprecise analysis (e.g. skipping functions) or a bug/"feature" in the program itself.')
-            # We'll convert as best as we can do...
-            # if len(addr.eval(20)) == 20:
-            #    l.warning('Returning more than 20 addresses - Unconstrained write?')
-            #    addr = claripy.vsa.ValueSet(region='global', bits=addr.bits, val=addr)
-            #else:
-            addr = claripy.vsa.ValueSet(region='global', bits=addr.bits, val=addr)
-            return addr
-        elif isinstance(addr, claripy.vsa.ValueSet):
-            return addr
+        :param claripy.ast.Base addr: Address to convert
+        :return: A list of mapping between region IDs and offsets.
+        :rtype: dict
+        """
+
+        addr_e = _raw_ast(addr)
+
+        if isinstance(addr_e, (claripy.bv.BVV, claripy.vsa.StridedInterval, claripy.vsa.ValueSet)):
+            raise SimMemoryError('_normalize_address_type() does not take claripy models.')
+
+        if isinstance(addr_e, claripy.ast.Base):
+            if not isinstance(addr_e._model_vsa, ValueSet):
+                # Convert it to a ValueSet first by annotating it
+                addr_e = addr_e.annotate(RegionAnnotation('global', 0, addr_e._model_vsa))
+
+            return addr_e._model_vsa.items()
+
         else:
-            raise SimMemoryError('Unsupported address type %s' % type(addr))
+            raise SimMemoryError('Unsupported address type %s' % type(addr_e))
 
     # FIXME: symbolic_length is also a hack!
     def _store(self, req):
@@ -367,9 +414,9 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
         if key not in self._regions:
             self._regions[key] = MemoryRegion(
                 key,
+                self.state,
                 is_stack=is_stack,
                 related_function_addr=related_function_addr,
-                state=self.state,
                 endness=self.endness
             )
 
@@ -395,11 +442,20 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
             return address_wrappers, self.state.se.Unconstrained(var_name, 32), [True]
 
         val = None
+
+        if len(address_wrappers) > 1 and AVOID_MULTIVALUED_READS in self.state.options:
+            val = self.state.se.Unconstrained('unconstrained_read', size * 8)
+            return address_wrappers, val, [True]
+
         for aw in address_wrappers:
             new_val = self._do_load(aw.address, size, aw.region,
                                  is_stack=aw.is_on_stack, related_function_addr=aw.function_address)
+
             if val is None:
-                val = new_val
+                if KEEP_MEMORY_READS_DISCRETE in self.state.options:
+                    val = self.state.se.DSIS(to_conv=new_val, max_card=100000)
+                else:
+                    val = new_val
             else:
                 val = val.union(new_val)
 
@@ -416,18 +472,24 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
 
         return self._regions[key].load(addr, size, bbl_addr, stmt_id, ins_addr)
 
-    def find(self, addr, what, max_search=None, max_symbolic_bytes=None, default=None):
+    def find(self, addr, what, max_search=None, max_symbolic_bytes=None, default=None, step=1):
         if type(addr) in (int, long):
             addr = self.state.se.BVV(addr, self.state.arch.bits)
 
-        addr = self._normalize_address_type(addr._model_vsa)
+        addr = self._normalize_address_type(addr)
 
         # TODO: For now we are only finding in one region!
-        for region, si in addr.items():
+        for region, si in addr:
             si = self.state.se.SI(to_conv=si)
-            r, s, i = self._regions[region].memory.find(si, what, max_search=max_search, max_symbolic_bytes=max_symbolic_bytes, default=default)
+            r, s, i = self._regions[region].memory.find(si, what, max_search=max_search,
+                                                        max_symbolic_bytes=max_symbolic_bytes, default=default,
+                                                        step=step
+                                                        )
             # Post process r so that it's still a ValueSet variable
-            r = self.state.se.ValueSet(region=region, bits=r.size(), val=r._model_vsa)
+
+            region_base_addr = self._region_base(region)
+
+            r = self.state.se.ValueSet(r.size(), region, region_base_addr, r._model_vsa)
 
             return r, s, i
 
@@ -509,40 +571,33 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
         am._stack_size = self._stack_size
         return am
 
-    def merge(self, others, merge_flag, flag_values):
+    def merge(self, others, merge_conditions):
         """
         Merge this guy with another SimAbstractMemory instance
-        :param others:
-        :param merge_flag:
-        :param flag_values:
-        :return:
         """
         merging_occurred = False
 
         for o in others:
             for region_id, region in o._regions.items():
                 if region_id in self._regions:
-                    merging_occurred |= self._regions[region_id].merge([region], merge_flag, flag_values)
+                    merging_occurred |= self._regions[region_id].merge([region], merge_conditions)
                 else:
                     merging_occurred = True
                     self._regions[region_id] = region
 
-        # We have no constraints to return!
-        return merging_occurred, []
+        return merging_occurred
 
-    def widen(self, others, merge_flag, flag_values):
-
+    def widen(self, others):
         widening_occurred = False
-
         for o in others:
             for region_id, region in o._regions.items():
                 if region_id in self._regions:
-                    widening_occurred |= self._regions[region_id].widen([ region ], merge_flag, flag_values)
+                    widening_occurred |= self._regions[region_id].widen([ region ])
                 else:
                     widening_occurred = True
                     self._regions[region_id] = region
 
-        return widening_occurred, [ ]
+        return widening_occurred
 
     def __contains__(self, dst):
         if type(dst) in (int, long):
@@ -551,10 +606,24 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
         addrs = self._normalize_address_type(dst)
 
 
-        for region, addr in addrs.items():
+        for region, addr in addrs:
             address_wrapper = self._normalize_address(region, addr.min)
 
             return address_wrapper.address in self.regions[address_wrapper.region]
+
+        return False
+
+    def was_written_to(self, dst):
+
+        if type(dst) in (int, long):
+            dst = self.state.se.BVV(dst, self.state.arch.bits)
+
+        addrs = self._normalize_address_type(dst)
+
+        for region, addr in addrs:
+            address_wrapper = self._normalize_address(region, addr.min)
+
+            return self.regions[address_wrapper.region].was_written_to(address_wrapper.address)
 
         return False
 
@@ -565,7 +634,3 @@ class SimAbstractMemory(SimMemory): #pylint:disable=abstract-method
         for region_id, region in self.regions.items():
             print "Region [%s]:" % region_id
             region.dbg_print(indent=2)
-
-from ..s_errors import SimMemoryError
-from ..storage.memory import MemoryStoreRequest, RegionMap
-from claripy.vsa import ValueSet

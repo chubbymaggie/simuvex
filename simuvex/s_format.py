@@ -2,6 +2,7 @@
 from .s_procedure import SimProcedure, SimProcedureError
 import string
 import simuvex
+import claripy
 import logging
 
 l = logging.getLogger("simuvex.parseformat")
@@ -53,6 +54,8 @@ class FormatString(object):
             # if this is just concrete data
             if isinstance(component, str):
                 string = self._add_to_string(string, self.parser.state.se.BVV(component))
+            elif isinstance(component, claripy.ast.BV):
+                string = self._add_to_string(string, component)
             else:
                 # okay now for the interesting stuff
                 # what type of format specifier is it?
@@ -114,7 +117,10 @@ class FormatString(object):
                 pass
             else:
                 fmt_spec = component
-                dest = args(argpos)
+                try:
+                    dest = args(argpos)
+                except SimProcedureArgumentError:
+                    dest = None
                 if fmt_spec.spec_type == 's':
                     # set some limits for the find
                     max_str_len = self.parser.state.libc.max_str_len
@@ -213,20 +219,20 @@ class FormatParser(SimProcedure):
     basic_spec = {
         'd': 'int',
         'i': 'int',
-        'o': 'uint',
-        'u': 'uint',
-        'x': 'uint',
-        'X': 'uint',
-        'e': 'dword',
-        'E': 'dword',
-        'f': 'dword',
-        'F': 'dword',
-        'g': 'dword',
-        'G': 'dword',
-        'a': 'dword',
-        'A': 'dword',
+        'o': 'unsigned int',
+        'u': 'unsigned int',
+        'x': 'unsigned int',
+        'X': 'unsigned int',
+        'e': 'double',
+        'E': 'double',
+        'f': 'double',
+        'F': 'double',
+        'g': 'double',
+        'G': 'double',
+        'a': 'double',
+        'A': 'double',
         'c': 'char',
-        's': 'string',
+        's': 'char*',
         'p': 'uintptr_t',
         'n': 'uintptr_t', # pointer to num bytes written so far
         'm': None, # Those don't expect any argument
@@ -328,16 +334,9 @@ class FormatParser(SimProcedure):
                 nugget = nugget[:len(spec)]
                 original_nugget = original_nugget[:(length_spec_str_len + len(spec))]
                 nugtype = all_spec[nugget]
-                typeobj = None
-                if nugtype in simuvex.s_type.ALL_TYPES:
-                    typeobj = simuvex.s_type.ALL_TYPES[nugtype](self.state.arch)
-                else:
-                    # we have to loop through these since the keys are tuples
-                    for k, v in simuvex.s_type._C_TYPE_TO_SIMTYPE.items():
-                        if nugtype in k:
-                            typeobj = v(self.state.arch)
-                            break
-                if typeobj is None:
+                try:
+                    typeobj = simuvex.s_type.parse_type(nugtype).with_arch(self.state.arch)
+                except:
                     raise SimProcedureError("format specifier uses unknown type '%s'" % repr(nugtype))
                 return FormatSpecifier(original_nugget, length_spec, typeobj.size / 8, typeobj.signed)
 
@@ -347,6 +346,7 @@ class FormatParser(SimProcedure):
         """
         Extract the actual formats from the format string `fmt`.
 
+        :param list fmt: A list of format chars.
         :returns: a FormatString object
         """
 
@@ -354,11 +354,16 @@ class FormatParser(SimProcedure):
         components = [ ]
         i = 0
         while i < len(fmt):
-            if fmt[i] == "%":
+            if type(fmt[i]) is str and fmt[i] == "%":
+                # Note that we only support concrete format specifiers
                 # grab the specifier
                 # go to the space
-                specifier = fmt[i+1:]
-
+                specifier = ""
+                for c in fmt[i+1:]:
+                    if type(c) is str:
+                        specifier += c
+                    else:
+                        break
 
                 specifier = self._match_spec(specifier)
                 if specifier is not None:
@@ -370,6 +375,8 @@ class FormatParser(SimProcedure):
                     i += 1
                     components.append('%')
             else:
+                # claripy ASTs, which are usually symbolic variables
+                # They will be kept as they are - even if those chars can be evaluated to "%"
                 components.append(fmt[i])
             i += 1
 
@@ -382,7 +389,7 @@ class FormatParser(SimProcedure):
 
         strtol = simuvex.SimProcedures['libc.so.6']['strtol']
 
-        return strtol.strtol_inner(str_addr, self.state, self.state.memory, base, True, read_length=read_length)
+        return strtol.strtol_inner(str_addr, self.state, region, base, True, read_length=read_length)
 
 
     def _sim_strlen(self, str_addr):
@@ -411,10 +418,26 @@ class FormatParser(SimProcedure):
 
         length = self._sim_strlen(fmtstr_ptr)
         if self.state.se.symbolic(length):
-            raise SimProcedureError("Symbolic (format) string, game over :(")
+            all_lengths = self.state.se.any_n_int(length, 2)
+            if len(all_lengths) != 1:
+                raise SimProcedureError("Symbolic (format) string, game over :(")
+            length = all_lengths[0]
+
+        if self.state.se.is_true(length == 0):
+            return FormatString(self, [""])
 
         fmt_xpr = self.state.memory.load(fmtstr_ptr, length)
-        fmt = self.state.se.any_str(fmt_xpr)
+
+        fmt = [ ]
+        for i in xrange(fmt_xpr.size(), 0, -8):
+            char = fmt_xpr[i - 1 : i - 8]
+            concrete_chars = self.state.se.any_n_int(char, 2)
+            if len(concrete_chars) == 1:
+                # Concrete chars are directly appended to the list
+                fmt.append(chr(concrete_chars[0]))
+            else:
+                # For symbolic chars, just keep them symbolic
+                fmt.append(char)
 
         # make a FormatString object
         fmt_str = self._get_fmt(fmt)
@@ -422,3 +445,5 @@ class FormatParser(SimProcedure):
         l.debug("Fmt: %r", fmt_str)
 
         return fmt_str
+
+from s_errors import SimProcedureArgumentError

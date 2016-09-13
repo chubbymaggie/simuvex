@@ -3,7 +3,12 @@ import simuvex
 class transmit(simuvex.SimProcedure):
     #pylint:disable=arguments-differ
 
+    IS_SYSCALL = True
+
     def run(self, fd, buf, count, tx_bytes):
+
+        if simuvex.options.CGC_ENFORCE_FD in self.state.options:
+            fd = 1
 
         if self.state.mode == 'fastpath':
             # Special case for CFG generation
@@ -17,7 +22,20 @@ class transmit(simuvex.SimProcedure):
             self.state.memory.store(tx_bytes, count, endness='Iend_LE')
 
         else:
-            if self.state.satisfiable(extra_constraints=[count != 0]):
+            # rules for invalid
+            # greater than 0xc0 or wraps around
+            if self.state.se.max_int(buf + count) > 0xc0000000 or \
+                    self.state.se.min_int(buf + count) < self.state.se.min_int(buf):
+                return 2
+
+            try:
+                readable = self.state.se.any_int(self.state.memory.permissions(self.state.se.any_int(buf))) & 1 != 0
+            except simuvex.SimMemoryError:
+                readable = False
+            if not readable:
+                return 2
+
+            if self.state.se.solution(count != 0, True):
                 data = self.state.memory.load(buf, count)
                 self.state.posix.write(fd, data, count)
                 self.data = data

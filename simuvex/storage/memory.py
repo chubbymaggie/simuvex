@@ -7,22 +7,27 @@ l = logging.getLogger("simuvex.storage.memory")
 import claripy
 from ..plugins.plugin import SimStatePlugin
 
+stn_map = { 'st%d' % n: n for n in xrange(8) }
+tag_map = { 'tag%d' % n: n for n in xrange(8) }
+
 class AddressWrapper(object):
     """
     AddressWrapper is used in SimAbstractMemory, which provides extra meta information for an address (or a ValueSet
     object) that is normalized from an integer/BVV/StridedInterval.
     """
 
-    def __init__(self, region, address, is_on_stack, function_address):
+    def __init__(self, region, region_base_addr, address, is_on_stack, function_address):
         """
         Constructor for the class AddressWrapper.
 
-        :param region:              Name of the memory regions it belongs to.
+        :param strregion:              Name of the memory regions it belongs to.
+        :param int region_base_addr:   Base address of the memory region
         :param address:             An address (not a ValueSet object).
-        :param is_on_stack:         Whether this address is on a stack region or not.
-        :param function_address:    Related function address (if any).
+        :param bool is_on_stack:       Whether this address is on a stack region or not.
+        :param int function_address:   Related function address (if any).
         """
         self.region = region
+        self.region_base_addr = region_base_addr
         self.address = address
         self.is_on_stack = is_on_stack
         self.function_address = function_address
@@ -43,7 +48,7 @@ class AddressWrapper(object):
         :param state: A state
         :return: The converted ValueSet instance
         """
-        return state.se.VS(bits=state.arch.bits, region=self.region, val=self.address)
+        return state.se.VS(state.arch.bits, self.region, self.region_base_addr, self.address)
 
 class RegionDescriptor(object):
     """
@@ -99,6 +104,10 @@ class RegionMap(object):
             raise SimRegionMapError('Calling "stack_base" on a non-stack region map.')
 
         return self._address_to_region_id.max_key()
+
+    @property
+    def region_ids(self):
+        return self._region_id_to_address.keys()
 
     #
     # Public methods
@@ -295,6 +304,9 @@ class SimMemory(SimStatePlugin):
         self._maximum_symbolic_size = 8 * 1024
         self._maximum_symbolic_size_approx = 4*1024
 
+        # Same, but for concrete writes
+        self._maximum_concrete_size = 0x1000000
+
     @property
     def category(self):
         """
@@ -316,6 +328,12 @@ class SimMemory(SimStatePlugin):
 
     def _resolve_location_name(self, name):
         if self.category == 'reg':
+            if self.state.arch.name in ('X86', 'AMD64'):
+                if name in stn_map:
+                    return (((stn_map[name] + self.load('ftop')) & 7) << 3) + self.state.arch.registers['fpu_regs'][0], 8
+                elif name in tag_map:
+                    return ((tag_map[name] + self.load('ftop')) & 7) + self.state.arch.registers['fpu_tags'][0], 1
+
             return self.state.arch.registers[name]
         elif name[0] == '*':
             return self.state.registers.load(name[1:]), None
@@ -338,7 +356,7 @@ class SimMemory(SimStatePlugin):
 
         return data_e
 
-    def store(self, addr, data, size=None, condition=None, add_constraints=None, endness=None, action=None, inspect=True):
+    def store(self, addr, data, size=None, condition=None, add_constraints=None, endness=None, action=None, inspect=True, priv=None):
         """
         Stores content into memory.
 
@@ -353,6 +371,8 @@ class SimMemory(SimStatePlugin):
         :param endness:         The endianness for the data.
         :param action:          A SimActionData to fill out with the final written value and constraints.
         """
+        if priv is not None: self.state.scratch.push_priv(priv)
+
         addr_e = _raw_ast(addr)
         data_e = _raw_ast(data)
         size_e = _raw_ast(size)
@@ -396,17 +416,17 @@ class SimMemory(SimStatePlugin):
                 size_e = self.state._inspect_getattr('mem_write_length', size_e)
                 data_e = self.state._inspect_getattr('mem_write_expr', data_e)
 
-        if (o.UNDER_CONSTRAINED_SYMEXEC in self.state.options and
-                isinstance(addr_e, claripy.ast.Base) and
-                addr_e.uninitialized
-            ):
-            # It's uninitialized. Did we initialize it to some other value before? Or, is it unbounded?
-            if not self.state.uc_manager.is_bounded(addr_e) or self.state.se.max_int(addr_e) - self.state.se.min_int(
-                    addr_e) >= self._read_address_range:
-                # in under-constrained symbolic execution, we'll assign a new memory region for this address
-                mem_region = self.state.uc_manager.assign(addr_e)
-                self.state.add_constraints(addr_e == mem_region)
-                l.debug('Under-constrained symbolic execution: assigned a new memory region @ %s to %s', mem_region, addr_e)
+        # if the condition is false, bail
+        if condition_e is not None and self.state.se.is_false(condition_e):
+            if priv is not None: self.state.scratch.pop_priv()
+            return
+
+        if (
+            o.UNDER_CONSTRAINED_SYMEXEC in self.state.options and
+            isinstance(addr_e, claripy.ast.Base) and
+            addr_e.uninitialized
+        ):
+            self._constrain_underconstrained_index(addr_e)
 
         request = MemoryStoreRequest(addr_e, data=data_e, size=size_e, condition=condition_e, endness=endness)
         self._store(request)
@@ -437,10 +457,11 @@ class SimMemory(SimStatePlugin):
             else:
                 action.added_constraints = action._make_object(self.state.se.true)
 
+        if priv is not None: self.state.scratch.pop_priv()
+
     def _store(self, request):
         raise NotImplementedError()
 
-    # TODO(sduquette) : endness should be renamed endianness.
     def store_cases(self, addr, contents, conditions, fallback=None, add_constraints=None, endness=None, action=None):
         """
         Stores content into memory, conditional by case.
@@ -585,20 +606,16 @@ class SimMemory(SimStatePlugin):
                 addr_e = self.state._inspect_getattr("mem_read_address", addr_e)
                 size_e = self.state._inspect_getattr("mem_read_length", size_e)
 
-        if (o.UNDER_CONSTRAINED_SYMEXEC in self.state.options and
-                isinstance(addr_e, claripy.ast.Base) and
-                addr_e.uninitialized
-                ):
-            # It's uninitialized. Did we initialize it to some other value before? Or, is it unbounded?
-            if not self.state.uc_manager.is_bounded(addr_e) or self.state.se.max_int(addr_e) - self.state.se.min_int(addr_e) >= self._read_address_range:
-                # in under-constrained symbolic execution, we'll assign a new memory region for this address
-                mem_region = self.state.uc_manager.assign(addr_e)
-                self.state.add_constraints(addr_e == mem_region)
-                l.debug('Under-constrained symbolic execution: assigned a new memory region @ %s to %s', mem_region, addr_e)
+        if (
+            o.UNDER_CONSTRAINED_SYMEXEC in self.state.options and
+            isinstance(addr_e, claripy.ast.Base) and
+            addr_e.uninitialized
+        ):
+            self._constrain_underconstrained_index(addr_e)
 
         a,r,c = self._load(addr_e, size_e, condition=condition_e, fallback=fallback_e)
         add_constraints = self.state._inspect_getattr('address_concretization_add_constraints', add_constraints)
-        if add_constraints:
+        if add_constraints and c:
             self.state.add_constraints(*c)
 
         if (self.category == 'mem' and o.SIMPLIFY_MEMORY_READS in self.state.options) or \
@@ -650,6 +667,16 @@ class SimMemory(SimStatePlugin):
 
         return r
 
+    def _constrain_underconstrained_index(self, addr_e):
+        if not self.state.uc_manager.is_bounded(addr_e) or self.state.se.max_int(addr_e) - self.state.se.min_int( addr_e) >= self._read_address_range:
+            # in under-constrained symbolic execution, we'll assign a new memory region for this address
+            mem_region = self.state.uc_manager.assign(addr_e)
+
+            # ... but only if it's not already been constrained to something!
+            if self.state.se.solution(addr_e, mem_region):
+                self.state.add_constraints(addr_e == mem_region)
+            l.debug('Under-constrained symbolic execution: assigned a new memory region @ %s to %s', mem_region, addr_e)
+
     def normalize_address(self, addr, is_write=False): #pylint:disable=no-self-use,unused-argument
         """
         Normalize `addr` for use in static analysis (with the abstract memory model). In non-abstract mode, simply
@@ -660,7 +687,7 @@ class SimMemory(SimStatePlugin):
     def _load(self, addr, size, condition=None, fallback=None):
         raise NotImplementedError()
 
-    def find(self, addr, what, max_search=None, max_symbolic_bytes=None, default=None):
+    def find(self, addr, what, max_search=None, max_symbolic_bytes=None, default=None, step=1):
         """
         Returns the address of bytes equal to 'what', starting from 'start'. Note that,  if you don't specify a default
         value, this search could cause the state to go unsat if no possible matching byte exists.
@@ -677,13 +704,18 @@ class SimMemory(SimStatePlugin):
         what = _raw_ast(what)
         default = _raw_ast(default)
 
-        r,c,m = self._find(addr, what, max_search=max_search, max_symbolic_bytes=max_symbolic_bytes, default=default)
+        if isinstance(what, str):
+            # Convert it to a BVV
+            what = claripy.BVV(what, len(what) * 8)
+
+        r,c,m = self._find(addr, what, max_search=max_search, max_symbolic_bytes=max_symbolic_bytes, default=default,
+                           step=step)
         if o.AST_DEPS in self.state.options and self.category == 'reg':
             r = SimActionObject(r, reg_deps=frozenset((addr,)))
 
         return r,c,m
 
-    def _find(self, addr, what, max_search=None, max_symbolic_bytes=None, default=None):
+    def _find(self, addr, what, max_search=None, max_symbolic_bytes=None, default=None, step=1):
         raise NotImplementedError()
 
     def copy_contents(self, dst, src, size, condition=None, src_memory=None, dst_memory=None):

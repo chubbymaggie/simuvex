@@ -12,26 +12,34 @@ from ..storage.memory_object import SimMemoryObject
 
 DEFAULT_MAX_SEARCH = 8
 
+def _multiwrite_filter(mem, ast):
+    return any("multiwrite" in var for var in mem.state.se.variables(ast))
+
 class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
     _CONCRETIZATION_STRATEGIES = [ 'symbolic', 'symbolic_approx', 'any', 'any_approx', 'max', 'max_approx',
                                    'symbolic_nonzero', 'symbolic_nonzero_approx', 'norepeats' ]
     _SAFE_CONCRETIZATION_STRATEGIES = [ 'symbolic', 'symbolic_approx' ]
 
-    def __init__(self, memory_backer=None, permissions_backer=None, mem=None, memory_id="mem", repeat_min=None,
-                 repeat_constraints=None, repeat_expr=None, endness=None, abstract_backer=False):
+    def __init__(
+        self, memory_backer=None, permissions_backer=None, mem=None, memory_id="mem",
+        endness=None, abstract_backer=False, check_permissions=None,
+        read_strategies=None, write_strategies=None
+    ):
         SimMemory.__init__(self, endness=endness, abstract_backer=abstract_backer)
-        self.mem = SimPagedMemory(memory_backer=memory_backer, permissions_backer=permissions_backer) if mem is None else mem
         self.id = memory_id
 
-        # for the norepeat stuff
-        self._repeat_constraints = [ ] if repeat_constraints is None else repeat_constraints
-        self._repeat_expr = repeat_expr
-        self._repeat_granularity = 0x10000
-        self._repeat_min = 0x13370000 if repeat_min is None else repeat_min
+        if check_permissions is None:
+            check_permissions = self.category == 'mem'
+        self.mem = SimPagedMemory(
+            memory_backer=memory_backer,
+            permissions_backer=permissions_backer,
+            check_permissions=check_permissions
+        ) if mem is None else mem
 
-        self._default_read_strategy = None
-        self._default_symbolic_write_strategy = None
-        self._default_write_strategy = None
+        # set up the strategies
+        self.read_strategies = read_strategies
+        self.write_strategies = write_strategies
+
 
     #
     # Lifecycle management
@@ -42,120 +50,102 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         Return a copy of the SimMemory.
         """
         #l.debug("Copying %d bytes of memory with id %s." % (len(self.mem), self.id))
-        c = SimSymbolicMemory(mem=self.mem.branch(),
-                              memory_id=self.id,
-                              repeat_min=self._repeat_min,
-                              repeat_constraints=self._repeat_constraints,
-                              repeat_expr=self._repeat_expr,
-                              endness=self.endness,
-                              abstract_backer=self._abstract_backer)
+        c = SimSymbolicMemory(
+            mem=self.mem.branch(),
+            memory_id=self.id,
+            endness=self.endness,
+            abstract_backer=self._abstract_backer,
+            read_strategies=[ s.copy() for s in self.read_strategies ],
+            write_strategies=[ s.copy() for s in self.write_strategies ],
+        )
 
-        c._default_read_strategy = list(self._default_read_strategy)
-        c._default_write_strategy = list(self._default_write_strategy)
-        c._default_symbolic_write_strategy = list(self._default_symbolic_write_strategy)
         return c
 
-    def merge(self, others, flag, flag_values):
+    #
+    # Merging stuff
+    #
+
+    def _changes_to_merge(self, others):
+        changed_bytes = set()
+
+        for o in others:  # pylint:disable=redefined-outer-name
+            changed_bytes |= self.changed_bytes(o)
+
+        if options.FRESHNESS_ANALYSIS in self.state.options and self.state.scratch.ignored_variables is not None:
+            ignored_var_changed_bytes = set()
+
+            if self.category == 'reg':
+                fresh_vars = self.state.scratch.ignored_variables.register_variables
+
+                for v in fresh_vars:
+                    offset, size = v.reg, v.size
+                    ignored_var_changed_bytes |= set(xrange(offset, offset + size))
+
+            else:
+                fresh_vars = self.state.scratch.ignored_variables.memory_variables
+
+                for v in fresh_vars:
+                    # v.addr is an AddressWrapper object
+                    region_id = v.addr.region
+                    offset = v.addr.address
+                    size = v.size
+
+                    if region_id == self.id:
+                        ignored_var_changed_bytes |= set(range(offset, offset + size))
+
+            changed_bytes = changed_bytes - ignored_var_changed_bytes
+
+        return changed_bytes
+
+    def merge(self, others, merge_conditions):
         """
         Merge this SimMemory with the other SimMemory
 
         :param others: A list of SimMemory objects to be merged with
-        :param flag:
-        :param flag_values:
-        :return: A tuple of (merging_occurred, extra_constraints)
+        :param merge_conditions:
+        :return: whether merging occurred
         """
 
-        changed_bytes = set()
-
-        for o in others:  # pylint:disable=redefined-outer-name
-            self._repeat_constraints += o._repeat_constraints
-            changed_bytes |= self.changed_bytes(o)
-
-        if options.FRESHNESS_ANALYSIS in self.state.options and self.state.scratch.ignored_variables is not None:
-            ignored_var_changed_bytes = set()
-
-            if self.id == 'reg':
-                fresh_vars = self.state.scratch.ignored_variables.register_variables
-
-                for v in fresh_vars:
-                    offset, size = v.reg, v.size
-                    ignored_var_changed_bytes |= set(xrange(offset, offset + size))
-
-            else:
-                fresh_vars = self.state.scratch.ignored_variables.memory_variables
-
-                for v in fresh_vars:
-                    # v.addr is an AddressWrapper object
-                    region_id = v.addr.region
-                    offset = v.addr.address
-                    size = v.size
-
-                    if region_id == self.id:
-                        ignored_var_changed_bytes |= set(range(offset, offset + size))
-
-            changed_bytes = changed_bytes - ignored_var_changed_bytes
+        changed_bytes = self._changes_to_merge(others)
 
         l.info("Merging %d bytes", len(changed_bytes))
         l.info("... %s has changed bytes %s", self.id, changed_bytes)
 
-        merging_occurred = len(changed_bytes) > 0
-        self._repeat_min = max(other._repeat_min for other in others)
+        self.read_strategies = self._merge_strategies(self.read_strategies, *[
+            o.read_strategies for o in others
+        ])
+        self.write_strategies = self._merge_strategies(self.write_strategies, *[
+            o.write_strategies for o in others
+        ])
+        self._merge(others, changed_bytes, merge_conditions=merge_conditions)
+        return len(changed_bytes) > 0
 
-        self._merge(others, changed_bytes, flag, flag_values)
+    @staticmethod
+    def _merge_strategies(*strategy_lists):
+        if len(set(len(sl) for sl in strategy_lists)) != 1:
+            raise SimMergeError("unable to merge memories with amounts of strategies")
 
-        # Generate constraints
-        if options.ABSTRACT_MEMORY in self.state.options:
-            constraints = []
-        else:
-            constraints = [self.state.se.Or(*[flag == fv for fv in flag_values])]
+        merged_strategies = [ ]
+        for strategies in zip(*strategy_lists):
+            if len(set(s.__class__ for s in strategies)) != 1:
+                raise SimMergeError("unable to merge memories with different types of strategies")
 
-        return merging_occurred, constraints
+            unique = list(set(strategies))
+            if len(unique) > 1:
+                unique[0].merge(unique[1:])
+            merged_strategies.append(unique[0])
+        return merged_strategies
 
-    def widen(self, others, merge_flag, flag_values):
-
-        widening_occurred = False
-        changed_bytes = set()
-
-        for o in others:  # pylint:disable=redefined-outer-name
-            self._repeat_constraints += o._repeat_constraints
-            changed_bytes |= self.changed_bytes(o)
-
-        if options.FRESHNESS_ANALYSIS in self.state.options and self.state.scratch.ignored_variables is not None:
-            ignored_var_changed_bytes = set()
-
-            if self.id == 'reg':
-                fresh_vars = self.state.scratch.ignored_variables.register_variables
-
-                for v in fresh_vars:
-                    offset, size = v.reg, v.size
-                    ignored_var_changed_bytes |= set(xrange(offset, offset + size))
-
-            else:
-                fresh_vars = self.state.scratch.ignored_variables.memory_variables
-
-                for v in fresh_vars:
-                    # v.addr is an AddressWrapper object
-                    region_id = v.addr.region
-                    offset = v.addr.address
-                    size = v.size
-
-                    if region_id == self.id:
-                        ignored_var_changed_bytes |= set(range(offset, offset + size))
-
-            changed_bytes = changed_bytes - ignored_var_changed_bytes
-
-        widening_occurred = (len(changed_bytes) > 0)
-
+    def widen(self, others):
+        changed_bytes = self._changes_to_merge(others)
         l.info("Memory %s widening bytes %s", self.id, changed_bytes)
+        self._merge(others, changed_bytes, is_widening=True)
+        return len(changed_bytes) > 0
 
-        # TODO: How to properly set the flag and flag_values?
-        self._merge(others, changed_bytes, merge_flag, flag_values, is_widening=True)
-
-        return widening_occurred
-
-    def _merge(self, others, changed_bytes, flag, flag_values, is_widening=False):
-
+    def _merge(self, others, changed_bytes, merge_conditions=None, is_widening=False):
         all_memories = [self] + others
+        if merge_conditions is None:
+            merge_conditions = [ None ] * len(all_memories)
 
         merged_to = None
         merged_objects = set()
@@ -170,7 +160,7 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
 
             # first get a list of all memory objects at that location, and
             # all memories that don't have those bytes
-            for sm, fv in zip(all_memories, flag_values):
+            for sm, fv in zip(all_memories, merge_conditions):
                 if b in sm.mem:
                     l.info("... present in %s", fv)
                     memory_objects.append((sm.mem[b], fv))
@@ -178,10 +168,11 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
                     l.info("... not present in %s", fv)
                     unconstrained_in.append((sm, fv))
 
+            mos = set(mo for mo,_ in memory_objects)
             mo_bases = set(mo.base for mo, _ in memory_objects)
             mo_lengths = set(mo.length for mo, _ in memory_objects)
 
-            if len(unconstrained_in) == 0 and len(set(memory_objects) - merged_objects) == 0:
+            if len(unconstrained_in) == 0 and len(mos - merged_objects) == 0:
                 continue
 
             # first, optimize the case where we are dealing with the same-sized memory objects
@@ -193,11 +184,14 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
                 mo_base = list(mo_bases)[0]
                 merged_to = mo_base + list(mo_lengths)[0]
 
-                merged_val = self._merge_values(to_merge, memory_objects[0][0].length, flag, is_widening=is_widening)
+                merged_val = self._merge_values(
+                    to_merge, memory_objects[0][0].length, is_widening=is_widening
+                )
 
                 # do the replacement
-                self.mem.replace_memory_object(our_mo, merged_val)
-                merged_objects.update(memory_objects)
+                new_object = self.mem.replace_memory_object(our_mo, merged_val)
+                merged_objects.add(new_object)
+                merged_objects.update(mos)
             else:
                 # get the size that we can merge easily. This is the minimum of
                 # the size of all memory objects and unallocated spaces.
@@ -213,34 +207,75 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
                 # Now, we have the minimum size. We'll extract/create expressions of that
                 # size and merge them
                 extracted = [(mo.bytes_at(b, min_size), fv) for mo, fv in memory_objects] if min_size != 0 else []
-                created = [(self.get_unconstrained_bytes("merge_uc_%s_%x" % (uc.id, b), min_size * 8), fv) for uc, fv in
-                           unconstrained_in]
+                created = [
+                    (self.get_unconstrained_bytes("merge_uc_%s_%x" % (uc.id, b), min_size * 8), fv) for
+                    uc, fv in unconstrained_in
+                ]
                 to_merge = extracted + created
 
-                merged_val = self._merge_values(to_merge, min_size, flag, is_widening=is_widening)
+                merged_val = self._merge_values(to_merge, min_size, is_widening=is_widening)
                 self.store(b, merged_val)
 
     def set_state(self, s):
         SimMemory.set_state(self, s)
         self.mem.state = s
 
-        if self.state is not None and self._default_read_strategy is None:
-            self._default_read_strategy = ['symbolic', 'any']
-            self._default_symbolic_write_strategy = [ 'symbolic_nonzero', 'any' ]
-            self._default_write_strategy = [ 'max' ] #[ 'norepeats',  'any' ]
+        if self.state is not None:
+            if self.read_strategies is None:
+                self._create_default_read_strategies()
+            if self.write_strategies is None:
+                self._create_default_write_strategies()
 
-            if options.APPROXIMATE_MEMORY_INDICES in self.state.options:
-                self._default_read_strategy.insert(0, 'symbolic_approx')
-                self._default_symbolic_write_strategy.insert(0, 'symbolic_nonzero_approx')
-                self._default_write_strategy.insert(0, 'max_approx')
+    def _create_default_read_strategies(self):
+        self.read_strategies = [ ]
+        if options.APPROXIMATE_MEMORY_INDICES in self.state.options:
+            # first, we try to resolve the read address by approximation
+            self.read_strategies.append(
+                concretization_strategies.SimConcretizationStrategyRange(1024, exact=False),
+            )
 
-            if options.SYMBOLIC_WRITE_ADDRESSES in self.state.options:
-                self._default_write_strategy.insert(0, 'symbolic_nonzero')
-                if options.APPROXIMATE_MEMORY_INDICES in self.state.options:
-                    self._default_write_strategy.insert(0, 'symbolic_nonzero_approx')
+        # then, we try symbolic reads, with a maximum width of a kilobyte
+        self.read_strategies.append(
+            concretization_strategies.SimConcretizationStrategyRange(1024)
+        )
 
-    def _ana_getstate(self):
-        return self.__dict__.copy()
+        if options.CONSERVATIVE_READ_STRATEGY not in self.state.options:
+            # finally, we concretize to any one solution
+            self.read_strategies.append(
+                concretization_strategies.SimConcretizationStrategyAny(),
+            )
+
+    def _create_default_write_strategies(self):
+        self.write_strategies = [ ]
+        if options.APPROXIMATE_MEMORY_INDICES in self.state.options:
+            if options.SYMBOLIC_WRITE_ADDRESSES not in self.state.options:
+                # we try to resolve a unique solution by approximation
+                self.write_strategies.append(
+                    concretization_strategies.SimConcretizationStrategySingle(exact=False),
+                )
+            else:
+                # we try a solution range by approximation
+                self.write_strategies.append(
+                    concretization_strategies.SimConcretizationStrategyRange(128, exact=False)
+                )
+
+        if options.SYMBOLIC_WRITE_ADDRESSES in self.state.options:
+            # we try to find a range of values
+            self.write_strategies.append(
+                concretization_strategies.SimConcretizationStrategyRange(128)
+            )
+        else:
+            # we try to find a range of values, but only for things named "multiwrite"
+            self.write_strategies.append(concretization_strategies.SimConcretizationStrategyRange(
+                128,
+                filter=_multiwrite_filter
+            ))
+
+        # finally, we just grab the maximum solution
+        if options.CONSERVATIVE_WRITE_STRATEGY not in self.state.options:
+            self.write_strategies.append(
+                concretization_strategies.SimConcretizationStrategyMax()
+            )
 
     #
     # Symbolicizing!
@@ -271,7 +306,13 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
     # Address concretization
     #
 
-    def _symbolic_size_range(self, size):
+    def _resolve_size_range(self, size):
+        if not self.state.se.symbolic(size):
+            i = self.state.se.any_int(size)
+            if i > self._maximum_concrete_size:
+                raise SimMemoryLimitError("Concrete size %d outside of allowable limits" % i)
+            return i, i
+
         if options.APPROXIMATE_MEMORY_SIZES in self.state.options:
             max_size_approx = self.state.se.max_int(size, exact=True)
             min_size_approx = self.state.se.min_int(size, exact=True)
@@ -295,182 +336,82 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
     # Concretization strategies
     #
 
-    def _concretization_strategy_norepeats(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        if self._repeat_expr is None:
-            self._repeat_expr = self.get_unconstrained_bytes("%s_repeat" % self.id, self.state.arch.bits)
+    def _apply_concretization_strategies(self, addr, strategies, action):
+        """
+        Applies concretization strategies on the address until one of them succeeds.
+        """
 
-        try:
-            c = self.state.se.any_int(v, extra_constraints=self._repeat_constraints + [ v == self._repeat_expr ])
-            self._repeat_constraints.append(self._repeat_expr != c)
-            return [ c ]
-        except SimUnsatError:
-            pass
+        # we try all the strategies in order
+        for s in strategies:
+            # first, we trigger the SimInspect breakpoint and give it a chance to intervene
+            e = addr
+            self.state._inspect(
+                'address_concretization', BP_BEFORE, address_concretization_strategy=s,
+                address_concretization_action=action, address_concretization_memory=self,
+                address_concretization_expr=e, address_concretization_add_constraints=True
+            )
+            s = self.state._inspect_getattr('address_concretization_strategy', s)
+            e = self.state._inspect_getattr('address_concretization_expr', addr)
 
-    def _concretization_strategy_symbolic(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        # if the address concretizes to less than the threshold of values, try to keep it symbolic
-        mx = self.state.se.max_int(v)
-        mn = self.state.se.min_int(v)
-
-        l.debug("... range is (%#x, %#x)", mn, mx)
-        if mx - mn <= limit:
-            return self.state.se.any_n_int(v, limit)
-
-    def _concretization_strategy_symbolic_approx(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        # if the address concretizes to less than the threshold of values, try to keep it symbolic
-        mx = self.state.se.max_int(v, exact=False)
-        mn = self.state.se.min_int(v, exact=False)
-
-        l.debug("... range is (%#x, %#x)", mn, mx)
-        if mx - mn <= approx_limit:
-            return self.state.se.any_n_int(v, approx_limit, exact=False)
-
-    def _concretization_strategy_symbolic_nonzero(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        # if the address concretizes to less than the threshold of values, try to keep it symbolic
-        mx = self.state.se.max_int(v, extra_constraints=[v != 0])
-        mn = self.state.se.min_int(v, extra_constraints=[v != 0])
-
-        l.debug("... range is (%#x, %#x)", mn, mx)
-        if mx - mn <= limit:
-            return self.state.se.any_n_int(v, limit)
-
-    def _concretization_strategy_symbolic_nonzero_approx(self, v, limit, approx_limit):
-        # if the address concretizes to less than the threshold of values, try to keep it symbolic
-        mx = self.state.se.max_int(v, extra_constraints=[v != 0], exact=False)
-        mn = self.state.se.min_int(v, extra_constraints=[v != 0], exact=False)
-
-        l.debug("... range is (%#x, %#x)", mn, mx)
-        if mx - mn <= approx_limit:
-            return self.state.se.any_n_int(v, limit, exact=False)
-
-    def _concretization_strategy_max_approx(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        mx = self.state.se.max_int(v, extra_constraints=[v != 0], exact=False)
-        mn = self.state.se.min_int(v, extra_constraints=[v != 0], exact=False)
-
-        if mx == mn:
-            return [mn]
-
-    def _concretization_strategy_max(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        return [self.state.se.max_int(v)]
-
-    def _concretization_strategy_any_approx(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        mx = self.state.se.max_int(v, extra_constraints=[v != 0], exact=False)
-        mn = self.state.se.min_int(v, extra_constraints=[v != 0], exact=False)
-
-        if mx == mn:
-            return [mn]
-
-    def _concretization_strategy_any(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        return [self.state.se.any_int(v)]
-
-    def _concretization_strategy_norepeats_simple(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        if self.state.se.solution(v, self._repeat_min):
-            l.debug("... trying super simple method.")
-            r = [ self._repeat_min ]
-            self._repeat_min += self._repeat_granularity
-            return r
-
-    def _concretization_strategy_norepeats_range(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        l.debug("... trying ranged simple method.")
-        r = [ self.state.se.any_int(v, extra_constraints = [ v > self._repeat_min, v < self._repeat_min + self._repeat_granularity ]) ]
-        self._repeat_min += self._repeat_granularity
-        return r
-
-    def _concretization_strategy_norepeats_min(self, v, limit, approx_limit): #pylint:disable=unused-argument
-        l.debug("... just getting any value.")
-        r = [ self.state.se.any_int(v, extra_constraints = [ v > self._repeat_min ]) ]
-        self._repeat_min = r[0] + self._repeat_granularity
-        return r
-
-    def _concretize_addr(self, v, strategy, limit, approx_limit, action):
-        # if there's only one option, let's do it
-        if not self.state.se.symbolic(v):
-            l.debug("... concrete value")
-            return [ self.state.se.any_int(v) ]
-
-        l.debug("... concretizing address with limit %d (approximate limit %d)", limit, approx_limit)
-
-        for s in strategy:
-            l.debug("... trying strategy %s", s)
-            try:
-                self.state._inspect('address_concretization', BP_BEFORE, address_concretization_strategy=s, 
-                                    address_concretization_action=action, address_concretization_memory_id=self.id, 
-                                    address_concretization_expr=v, address_concretization_limit=limit, 
-                                    address_concretization_approx_limit=approx_limit, 
-                                    address_concretization_add_constraints=True)
-                s = self.state._inspect_getattr('address_concretization_strategy', s)
-                v = self.state._inspect_getattr('address_concretization_expr', v)
-                limit = self.state._inspect_getattr('address_concretization_limit', limit)
-                approx_limit = self.state._inspect_getattr('address_concretization_approx_limit', approx_limit)
-
-                result = getattr(self, '_concretization_strategy_'+s)(v, limit, approx_limit)
-                if options.VALIDATE_APPROXIMATIONS in self.state.options and hasattr(self, '_concretization_strategy_'+s+'_approx'):
-                    c = self.state.copy()
-                    approx_result = getattr(c.memory, '_concretization_strategy_'+s+'_approx')(v, limit, approx_limit)
-                    new_result = getattr(c.memory, '_concretization_strategy_'+s)(v, limit, approx_limit)
-                    if result != new_result or (approx_result is not None and result is not None and not set(result).issubset(set(approx_result))):
-                        raise Exception("WTF")
-
-                self.state._inspect('address_concretization', BP_AFTER, address_concretization_result=result)
-                result = self.state._inspect_getattr('address_concretization_result', result)
-
-                if result is not None:
-                    return result
-                else:
-                    l.debug("... failed (with None)")
-            except SimUnsatError:
-                l.debug("... failed (with exception)")
+            # if the breakpoint None'd out the strategy, we skip it
+            if s is None:
                 continue
 
-        raise SimMemoryAddressError("Unable to concretize address with the provided strategy.")
+            # let's try to apply it!
+            try:
+                a = s.concretize(self, e)
+            except SimUnsatError:
+                a = None
 
-    def concretize_write_addr(self, addr, strategy=None, limit=None, approx_limit=None):
+            # trigger the AFTER breakpoint and give it a chance to intervene
+            self.state._inspect(
+                'address_concretization', BP_AFTER,
+                address_concretization_result=a
+            )
+            a = self.state._inspect_getattr('address_concretization_result', a)
+
+            # return the result if not None!
+            if a is not None:
+                return a
+
+        # well, we tried
+        raise SimMemoryAddressError(
+            "Unable to concretize address for %s with the provided strategies." % action
+        )
+
+    def concretize_write_addr(self, addr, strategies=None):
         """
         Concretizes an address meant for writing.
 
-            :param addr: an expression for the address
-            :param strategy: the strategy to use for concretization
-            :param limit: how many concrete values to limit the concretization to
-            :param approx_limit: how many concrete values to limit the concretization to,
-                                 if an approximation backend can be used for this value.
-
-            @returns a list of concrete addresses
+            :param addr:            An expression for the address.
+            :param strategies:      A list of concretization strategies (to override the default).
+            :returns:               A list of concrete addresses.
         """
 
         if isinstance(addr, (int, long)):
-            return [addr]
+            return [ addr ]
+        elif not self.state.se.symbolic(addr):
+            return [ self.state.se.any_int(addr) ]
 
-        #l.debug("concretizing addr: %s with variables", addr.variables)
-        if strategy is None:
-            if any([ "multiwrite" in c for c in self.state.se.variables(addr) ]):
-                l.debug("... defaulting to symbolic write!")
-                strategy = self._default_symbolic_write_strategy
-            else:
-                l.debug("... defaulting to concrete write!")
-                strategy = self._default_write_strategy
+        strategies = self.write_strategies if strategies is None else strategies
+        return self._apply_concretization_strategies(addr, strategies, 'store')
 
-        approx_limit = self._write_address_range_approx if approx_limit is None else approx_limit
-        limit = self._write_address_range if limit is None else limit
-        return self._concretize_addr(addr, strategy=strategy, limit=limit, approx_limit=approx_limit, action='store')
-
-    def concretize_read_addr(self, addr, strategy=None, limit=None):
+    def concretize_read_addr(self, addr, strategies=None):
         """
         Concretizes an address meant for reading.
 
             :param addr:            An expression for the address.
-            :param strategy:        The strategy to use for concretization.
-            :param limit:           How many concrete values to limit the concretization to.
-            :param approx_limit:    How many concrete values to limit the concretization to if an approximation
-                                    backend can be used for this value.
-
+            :param strategies:      A list of concretization strategies (to override the default).
             :returns:               A list of concrete addresses.
         """
-        if isinstance(addr, (int, long)):
-            return [addr]
-        strategy = self._default_read_strategy if strategy is None else strategy
-        limit = self._read_address_range if limit is None else limit
-        approx_limit = self._read_address_range_approx if limit is None else limit
 
-        return self._concretize_addr(addr, strategy=strategy, limit=limit, approx_limit=approx_limit, action='load')
+        if isinstance(addr, (int, long)):
+            return [ addr ]
+        elif not self.state.se.symbolic(addr):
+            return [ self.state.se.any_int(addr) ]
+
+        strategies = self.read_strategies if strategies is None else strategies
+        return self._apply_concretization_strategies(addr, strategies, 'load')
 
     def normalize_address(self, addr, is_write=False):
         return self.concretize_read_addr(addr)
@@ -480,14 +421,14 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
     #
 
     def _read_from(self, addr, num_bytes):
-        the_bytes, missing =  self.mem.load_bytes(addr, num_bytes)
+        the_bytes, missing, _ =  self.mem.load_bytes(addr, num_bytes)
 
         if len(missing) > 0:
             name = "%s_%x" % (self.id, addr)
             all_missing = [ self.get_unconstrained_bytes(name, min(self.mem._page_size, num_bytes)*8, source=i) for i in range(addr, addr+num_bytes, self.mem._page_size) ]
-            if self.id == 'reg' and self.state.arch.register_endness == 'Iend_LE':
+            if self.category == 'reg' and self.state.arch.register_endness == 'Iend_LE':
                 all_missing = [ a.reversed for a in all_missing ]
-            if self.id == 'mem' and self.state.arch.memory_endness == 'Iend_LE':
+            elif self.category != 'reg' and self.state.arch.memory_endness == 'Iend_LE':
                 all_missing = [ a.reversed for a in all_missing ]
             b = self.state.se.Concat(*all_missing) if len(all_missing) > 1 else all_missing[0]
 
@@ -496,7 +437,9 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
             for m in missing:
                 the_bytes[m] = default_mo
             #   self.mem[addr+m] = default_mo
+            self.state.scratch.push_priv(True)
             self.mem.store_memory_object(default_mo, overwrite=False)
+            self.state.scratch.pop_priv()
 
         if 0 in the_bytes and isinstance(the_bytes[0], SimMemoryObject) and len(the_bytes) == the_bytes[0].object.length/8:
             for mo in the_bytes.itervalues():
@@ -527,13 +470,12 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
 
         return r
 
-
     def _load(self, dst, size, condition=None, fallback=None):
         if self.state.se.symbolic(size):
             l.warning("Concretizing symbolic length. Much sad; think about implementing.")
 
         # for now, we always load the maximum size
-        _,max_size = self._symbolic_size_range(size)
+        _,max_size = self._resolve_size_range(size)
         if options.ABSTRACT_MEMORY not in self.state.options and self.state.se.symbolic(size):
             self.state.add_constraints(size == max_size, action=True)
 
@@ -545,13 +487,15 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
             return [ ], self.get_unconstrained_bytes("symbolic_read_" + ','.join(self.state.se.variables(dst)), size*8), [ ]
 
         # get a concrete set of read addresses
-        if options.CONSERVATIVE_READ_STRATEGY in self.state.options:
-            try:
-                addrs = self.concretize_read_addr(dst, strategy=self._SAFE_CONCRETIZATION_STRATEGIES)
-            except SimMemoryError:
-                return [ ], self.get_unconstrained_bytes("symbolic_read_" + ','.join(self.state.se.variables(dst)), size*8), [ ]
-        else:
+        try:
             addrs = self.concretize_read_addr(dst)
+        except SimMemoryError:
+            if options.CONSERVATIVE_READ_STRATEGY in self.state.options:
+                return [ ], self.get_unconstrained_bytes(
+                    "symbolic_read_" + ','.join(self.state.se.variables(dst)), size*8
+                ), [ ]
+            else:
+                raise
 
         read_value = self._read_from(addrs[0], size)
         constraint_options = [ dst == addrs[0] ]
@@ -573,7 +517,7 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
 
         return addrs, read_value, load_constraint
 
-    def _find(self, start, what, max_search=None, max_symbolic_bytes=None, default=None):
+    def _find(self, start, what, max_search=None, max_symbolic_bytes=None, default=None, step=1):
         if max_search is None:
             max_search = DEFAULT_MAX_SEARCH
 
@@ -586,12 +530,15 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         symbolic_what = self.state.se.symbolic(what)
         l.debug("Search for %d bytes in a max of %d...", seek_size, max_search)
 
-        all_memory = self.load(start, max_search, endness="Iend_BE")
+        chunk_start = 0
+        chunk_size = max(0x100, seek_size + 0x80)
+        chunk = self.load(start, chunk_size, endness="Iend_BE")
 
         cases = [ ]
         match_indices = [ ]
         offsets_matched = [ ] # Only used in static mode
-        for i in itertools.count():
+
+        for i in itertools.count(step=step):
             l.debug("... checking offset %d", i)
             if i > max_search - seek_size:
                 l.debug("... hit max size")
@@ -599,8 +546,13 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
             if remaining_symbolic is not None and remaining_symbolic == 0:
                 l.debug("... hit max symbolic")
                 break
+            if i - chunk_start > chunk_size - seek_size:
+                l.debug("loading new chunk")
+                chunk_start += chunk_size - seek_size + 1
+                chunk = self.load(start+chunk_start, chunk_size, endness="Iend_BE")
 
-            b = all_memory[max_search*8 - i*8 - 1 : max_search*8 - i*8 - seek_size*8]
+            chunk_off = i-chunk_start
+            b = chunk[chunk_size*8 - chunk_off*8 - 1 : chunk_size*8 - chunk_off*8 - seek_size*8]
             cases.append([b == what, start + i])
             match_indices.append(i)
 
@@ -654,13 +606,21 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         if isinstance(dst, (int, long)):
             addr = dst
         elif self.state.se.symbolic(dst):
-            try:
-                addr = self._concretize_addr(dst, strategy=['allocated'], limit=1, approx_limit=1, action='load')[0]
-            except SimMemoryError:
-                return False
+            l.warning("Currently unable to do SimMemory.__contains__ on symbolic variables.")
+            return False
         else:
             addr = self.state.se.any_int(dst)
         return addr in self.mem
+
+    def was_written_to(self, dst):
+        if isinstance(dst, (int, long)):
+            addr = dst
+        elif self.state.se.symbolic(dst):
+            l.warning("Currently unable to do SimMemory.was_written_to on symbolic variables.")
+            return False
+        else:
+            addr = self.state.se.any_int(dst)
+        return self.mem.contains_no_backer(addr)
 
     #
     # Writes
@@ -676,20 +636,24 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         if self.state.se.symbolic(req.addr) and options.AVOID_MULTIVALUED_WRITES in self.state.options:
             return req
 
+        if req.size is not None and self.state.se.symbolic(req.size) and options.CONCRETIZE_SYMBOLIC_WRITE_SIZES in self.state.options:
+            new_size = self.state.se.any_int(req.size)
+            req.constraints.append(req.size == new_size)
+            req.size = new_size
+
         max_bytes = len(req.data)/8
 
         #
         # First, resolve the addresses
         #
 
-        if options.CONSERVATIVE_WRITE_STRATEGY in self.state.options:
-            try:
-                req.actual_addresses = self.concretize_write_addr(req.addr, strategy=self._SAFE_CONCRETIZATION_STRATEGIES)
-            except SimMemoryError:
-                return req
-        else:
+        try:
             req.actual_addresses = self.concretize_write_addr(req.addr)
-
+        except SimMemoryError:
+            if options.CONSERVATIVE_WRITE_STRATEGY in self.state.options:
+                return req
+            else:
+                raise
         num_addresses = len(req.actual_addresses)
 
         #
@@ -751,14 +715,19 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
                 cv = self.state.se.If(self.state.se.And(req.addr == a, req.condition), sv, fv)
 
             req.conditional_values.append(cv)
-            req.constraints.append(self.state.se.Or(*[ req.addr == a for a in req.actual_addresses ]))
+
+        if type(req.addr) not in (int, long) and req.addr.symbolic:
+            conditional_constraint = self.state.se.Or(*[ req.addr == a for a in req.actual_addresses ])
+            if (conditional_constraint.symbolic or  # if the constraint is symbolic
+                    conditional_constraint.is_false()):  # if it makes the state go unsat
+                req.constraints.append(conditional_constraint)
 
         #
         # now simplify
         #
 
-        if (self.id == 'mem' and options.SIMPLIFY_MEMORY_WRITES in self.state.options) or \
-           (self.id == 'reg' and options.SIMPLIFY_REGISTER_WRITES in self.state.options):
+        if (self.category == 'mem' and options.SIMPLIFY_MEMORY_WRITES in self.state.options) or \
+           (self.category == 'reg' and options.SIMPLIFY_REGISTER_WRITES in self.state.options):
             req.simplified_values = [ self.state.se.simplify(cv) for cv in req.conditional_values ]
         else:
             req.simplified_values = list(req.conditional_values)
@@ -779,7 +748,9 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         for a,sv in zip(req.actual_addresses, req.stored_values):
             # here, we ensure the uuids are generated for every expression written to memory
             sv.make_uuid()
-            mo = SimMemoryObject(sv, a, length=len(sv)/8)
+            size = len(sv)/8
+            self.state.scratch.dirty_addrs.update(range(a, a+size))
+            mo = SimMemoryObject(sv, a, length=size)
             self.mem.store_memory_object(mo)
 
         l.debug("... done")
@@ -876,7 +847,7 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         :return: The generated variable
         """
 
-        if (self.id == 'mem' and
+        if (self.category == 'mem' and
                 options.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY in self.state.options):
             # CGC binaries zero-fill the memory for any allocated region
             # Reference: (https://github.com/CyberGrandChallenge/libcgc/blob/master/allocate.md)
@@ -908,9 +879,9 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
     def _is_uninitialized(a):
         return getattr(a._model_vsa, 'uninitialized', False)
 
-    def _merge_values(self, to_merge, merged_size, merge_flag, is_widening=False):
+    def _merge_values(self, to_merge, merged_size, is_widening=False):
         if options.ABSTRACT_MEMORY in self.state.options:
-            if self.id == 'reg' and self.state.arch.register_endness == 'Iend_LE':
+            if self.category == 'reg' and self.state.arch.register_endness == 'Iend_LE':
                 should_reverse = True
             elif self.state.arch.memory_endness == 'Iend_LE':
                 should_reverse = True
@@ -940,7 +911,7 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
             merged_val = self.state.se.BVV(0, merged_size*8)
             for tm,fv in to_merge:
                 l.debug("In merge: %s if flag is %s", tm, fv)
-                merged_val = self.state.se.If(merge_flag == fv, tm, merged_val)
+                merged_val = self.state.se.If(fv, tm, merged_val)
 
         return merged_val
 
@@ -981,7 +952,7 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         src_memory = self if src_memory is None else src_memory
         dst_memory = self if dst_memory is None else dst_memory
 
-        _,max_size = self._symbolic_size_range(size)
+        _,max_size = self._resolve_size_range(size)
         if max_size == 0:
             return None, [ ]
 
@@ -995,10 +966,10 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
 
     def changed_bytes(self, other):
         """
-        Gets the set of changed bytes between self and other.
+        Gets the set of changed bytes between self and `other`.
 
-        :param other: the other SimSymbolicMemory
-        @returns a set of differing bytes
+        :param other:   The other :class:`SimSymbolicMemory`.
+        :returns:       A set of differing bytes
         """
         return self.mem.changed_bytes(other.mem)
 
@@ -1006,9 +977,9 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         """
         Replaces all instances of expression old with expression new.
 
-            :param old: a claripy expression. Must contain at least one named variable (to make
-                        to make it possible to use the name index for speedup)
-            :param new: the new variable to replace it with
+        :param old: A claripy expression. Must contain at least one named variable (to make
+                    to make it possible to use the name index for speedup)
+        :param new: The new variable to replace it with
         """
 
         return self.mem.replace_all(old, new)
@@ -1016,14 +987,14 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
     def addrs_for_name(self, n):
         """
         Returns addresses that contain expressions that contain a variable
-        named n.
+        named `n`.
         """
         return self.mem.addrs_for_name(n)
 
     def addrs_for_hash(self, h):
         """
         Returns addresses that contain expressions that contain a variable
-        with the hash of h.
+        with the hash of `h`.
         """
         return self.mem.addrs_for_hash(h)
 
@@ -1032,9 +1003,9 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         Replaces the memory object 'old' with a new memory object containing
         'new_content'.
 
-            :param old: a SimMemoryObject (i.e., one from memory_objects_for_hash() or
-                        memory_objects_for_name())
-            :param new_content: the content (claripy expression) for the new memory object
+        :param old:         A SimMemoryObject (i.e., one from memory_objects_for_hash() or
+                            memory_objects_for_name())
+        :param new_content: the content (claripy expression) for the new memory object
         """
         return self.mem.replace_memory_object(old, new_content)
 
@@ -1055,25 +1026,34 @@ class SimSymbolicMemory(SimMemory): #pylint:disable=abstract-method
         return self.mem.memory_objects_for_hash(n)
 
     def permissions(self, addr):
-        '''
+        """
         Retrieve the permissions of the page at address `addr`.
 
         :param addr: address to get the page permissions
         :return: AST representing the permissions on the page
-        '''
+        """
         return self.mem.permissions(addr)
 
     def map_region(self, addr, length, permissions):
-        '''
+        """
         Map a number of pages at address `addr` with permissions `permissions`.
         :param addr: address to map the pages at
         :param length: length in bytes of region to map, will be rounded upwards to the page size
         :param permissions: AST of permissions to map, will be a bitvalue representing flags
-        '''
+        """
         return self.mem.map_region(addr, length, permissions)
+
+    def unmap_region(self, addr, length):
+        """
+        Unmap a number of pages at address `addr`
+        :param addr: address to unmap the pages at
+        :param length: length in bytes of region to map, will be rounded upwards to the page size
+        """
+        return self.mem.unmap_region(addr, length)
 
 SimSymbolicMemory.register_default('memory', SimSymbolicMemory)
 SimSymbolicMemory.register_default('registers', SimSymbolicMemory)
-from ..s_errors import SimUnsatError, SimMemoryError, SimMemoryLimitError, SimMemoryAddressError
+from ..s_errors import SimUnsatError, SimMemoryError, SimMemoryLimitError, SimMemoryAddressError, SimMergeError
 from .. import s_options as options
 from .inspect import BP_AFTER, BP_BEFORE
+from .. import concretization_strategies

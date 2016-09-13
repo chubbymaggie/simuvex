@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 from .plugin import SimStatePlugin
-from ..s_action_object import ast_stripping_op as _actual_ast_stripping_op
+from ..s_action_object import ast_stripping_decorator, SimActionObject
 
 import sys
 import functools
@@ -18,31 +18,43 @@ _timing_enabled = False
 
 import time
 lt = logging.getLogger('simuvex.plugins.solver.timing')
-def ast_stripping_op(f, *args, **kwargs):
-    the_solver = kwargs.pop('the_solver', None)
+def timed_function(f):
     if _timing_enabled:
-        the_solver = args[0] if the_solver is None else the_solver
-        s = the_solver.state
+        @functools.wraps(f)
+        def timing_guy(*args, **kwargs):
+            the_solver = kwargs.pop('the_solver', None)
+            the_solver = args[0] if the_solver is None else the_solver
+            s = the_solver.state
 
-        start = time.time()
-        r = _actual_ast_stripping_op(f, *args, **kwargs)
-        end = time.time()
-        duration = end-start
+            start = time.time()
+            r = f(*args, **kwargs)
+            end = time.time()
+            duration = end-start
 
-        if s.scratch.sim_procedure is None and s.scratch.bbl_addr is not None:
-            location = "bbl 0x%x, stmt %d (inst 0x%x)" % (s.scratch.bbl_addr, s.scratch.stmt_idx, s.scratch.ins_addr)
-        elif s.scratch.sim_procedure is not None:
-            location = "sim_procedure %s" % s.scratch.sim_procedure
-        else:
-            location = "unknown"
-        lt.log(int((end-start)*10), '%s took %s seconds at %s', f.__name__, round(duration, 2), location)
+            try:
+                if s.scratch.sim_procedure is None and s.scratch.bbl_addr is not None:
+                    location = "bbl %#x, stmt %s (inst %s)" % (
+                        s.scratch.bbl_addr,
+                        s.scratch.stmt_idx,
+                        ('%s' % s.scratch.ins_addr if s.scratch.ins_addr is None else '%#x' % s.scratch.ins_addr)
+                    )
+                elif s.scratch.sim_procedure is not None:
+                    location = "sim_procedure %s" % s.scratch.sim_procedure
+                else:
+                    location = "unknown"
+            except Exception: #pylint:disable=broad-except
+                l.error("Got exception while generating timer message:", exc_info=True)
+                location = "unknown"
+            lt.log(int((end-start)*10), '%s took %s seconds at %s', f.__name__, round(duration, 2), location)
 
-        if break_time >= 0 and duration > break_time:
-            import ipdb; ipdb.set_trace()
+            if break_time >= 0 and duration > break_time:
+                import ipdb; ipdb.set_trace()
+
+            return r
+
+        return timing_guy
     else:
-        r = _actual_ast_stripping_op(f, *args, **kwargs)
-
-    return r
+        return f
 
 #pylint:disable=global-variable-undefined
 def enable_timing():
@@ -67,17 +79,11 @@ break_time = float(os.environ.get('SOLVER_BREAK_TIME', -1))
 # Various over-engineered crap
 #
 
-def auto_actions(f):
-    @functools.wraps(f)
-    def autoed_f(self, *args, **kwargs):
-        return ast_stripping_op(f, self, *args, **kwargs)
-    return autoed_f
-
 def error_converter(f):
     @functools.wraps(f)
-    def wrapped_f(self, *args, **kwargs):
+    def wrapped_f(*args, **kwargs):
         try:
-            return f(self, *args, **kwargs)
+            return f(*args, **kwargs)
         except claripy.UnsatError:
             e_type, value, traceback = sys.exc_info()
             raise SimUnsatError, ("Got an unsat result", e_type, value), traceback
@@ -85,6 +91,85 @@ def error_converter(f):
             e_type, value, traceback = sys.exc_info()
             raise SimSolverModeError, ("Translated claripy error:", e_type, value), traceback
     return wrapped_f
+
+#
+# Premature optimizations
+#
+
+def _concrete_bool(e):
+    if isinstance(e, bool):
+        return e
+    elif isinstance(e, claripy.ast.Base) and e.op == 'BoolV':
+        return e.args[0]
+    elif isinstance(e, SimActionObject) and e.op == 'BoolV':
+        return e.args[0]
+    else:
+        return None
+
+def _concrete_value(e):
+    # shortcuts for speed improvement
+    if isinstance(e, (int, long, float, bool)):
+        return e
+    elif isinstance(e, claripy.ast.Base) and e.op in claripy.operations.leaf_operations_concrete:
+        return e.args[0]
+    elif isinstance(e, SimActionObject) and e.op in claripy.operations.leaf_operations_concrete:
+        return e.args[0]
+    else:
+        return None
+
+def concrete_path_bool(f):
+    @functools.wraps(f)
+    def concrete_shortcut_bool(self, *args, **kwargs):
+        v = _concrete_bool(args[0])
+        if v is None:
+            return f(self, *args, **kwargs)
+        else:
+            return v
+    return concrete_shortcut_bool
+
+def concrete_path_not_bool(f):
+    @functools.wraps(f)
+    def concrete_shortcut_not_bool(self, *args, **kwargs):
+        v = _concrete_bool(args[0])
+        if v is None:
+            return f(self, *args, **kwargs)
+        else:
+            return not v
+    return concrete_shortcut_not_bool
+
+def concrete_path_scalar(f):
+    @functools.wraps(f)
+    def concrete_shortcut_scalar(self, *args, **kwargs):
+        v = _concrete_value(args[0])
+        if v is None:
+            return f(self, *args, **kwargs)
+        else:
+            return v
+    return concrete_shortcut_scalar
+
+def concrete_path_tuple(f):
+    @functools.wraps(f)
+    def concrete_shortcut_tuple(self, *args, **kwargs):
+        v = _concrete_value(args[0])
+        if v is None:
+            return f(self, *args, **kwargs)
+        else:
+            return ( v, )
+    return concrete_shortcut_tuple
+
+def concrete_path_list(f):
+    @functools.wraps(f)
+    def concrete_shortcut_list(self, *args, **kwargs):
+        v = _concrete_value(args[0])
+        if v is None:
+            return f(self, *args, **kwargs)
+        else:
+            return [ v ]
+    return concrete_shortcut_list
+
+#
+# The main event
+#
 
 import claripy
 class SimSolver(SimStatePlugin):
@@ -96,14 +181,14 @@ class SimSolver(SimStatePlugin):
         SimStatePlugin.__init__(self)
         self._stored_solver = solver
 
-    def _ana_getstate(self):
-        return self._stored_solver, self.state
+    def reload_solver(self):
+        """
+        Reloads the solver. Useful when changing solver options.
+        """
 
-    def _ana_setstate(self, s):
-        self._stored_solver, self.state = s
-
-    def set_state(self, state):
-        SimStatePlugin.set_state(self, state)
+        constraints = self._solver.constraints
+        self._stored_solver = None
+        self._solver.add(constraints)
 
     @property
     def _solver(self):
@@ -111,18 +196,19 @@ class SimSolver(SimStatePlugin):
             return self._stored_solver
 
         if o.ABSTRACT_SOLVER in self.state.options:
-            self._stored_solver = claripy.LightFrontend(claripy.backends.vsa, cache=False)
+            self._stored_solver = claripy.SolverVSA()
         elif o.REPLACEMENT_SOLVER in self.state.options:
-            self._stored_solver = claripy.ReplacementFrontend(claripy.FullFrontend(claripy.backends.z3), unsafe_replacement=True)
+            self._stored_solver = claripy.SolverReplacement(auto_replace=False)
+        elif o.CACHELESS_SOLVER in self.state.options:
+            self._stored_solver = claripy.SolverCacheless()
         elif o.COMPOSITE_SOLVER in self.state.options:
-            self._stored_solver = claripy.CompositeFrontend(claripy.hybrid_vsa_z3())
+            self._stored_solver = claripy.SolverComposite()
+        elif o.SYMBOLIC in self.state.options and o.approximation & self.state.options:
+            self._stored_solver = claripy.SolverHybrid()
         elif o.SYMBOLIC in self.state.options:
-            if o.approximation & self.state.options:
-                self._stored_solver = claripy.hybrid_vsa_z3()
-            else:
-                self._stored_solver = claripy.FullFrontend(claripy.backends.z3)
+            self._stored_solver = claripy.Solver()
         else:
-            self._stored_solver = claripy.LightFrontend(claripy.backends.concrete)
+            self._stored_solver = claripy.SolverConcrete()
 
         return self._stored_solver
 
@@ -176,7 +262,9 @@ class SimSolver(SimStatePlugin):
     def __getattr__(self, a):
         f = getattr(claripy._all_operations, a)
         if hasattr(f, '__call__'):
-            ff = functools.partial(ast_stripping_op, f, the_solver=self)
+            ff = error_converter(ast_stripping_decorator(f))
+            if _timing_enabled:
+                ff = functools.partial(timed_function(ff), the_solver=self)
             ff.__doc__ = f.__doc__
             return ff
         else:
@@ -193,16 +281,20 @@ class SimSolver(SimStatePlugin):
         return SimSolver(solver=self._solver.branch())
 
     @error_converter
-    def merge(self, others, merge_flag, flag_values): # pylint: disable=W0613
+    def merge(self, others, merge_conditions): # pylint: disable=W0613
         #import ipdb; ipdb.set_trace()
-        merging_occurred, self._stored_solver = self._solver.merge([ oc._solver for oc in others ], merge_flag, flag_values)
+        merging_occurred, self._stored_solver = self._solver.merge(
+            [ oc._solver for oc in others ],
+            merge_conditions,
+        )
         #import ipdb; ipdb.set_trace()
-        return merging_occurred, [ ]
+        return merging_occurred
 
-    def widen(self, others, merge_flag, flag_values):
-
-        merging_occurred, _ = self.merge(others, merge_flag, flag_values)
-
+    @error_converter
+    def widen(self, others):
+        c = self.state.se.BVS('random_widen_condition', 32)
+        merge_conditions = [ [ c == i ] for i in range(len(others)+1) ]
+        merging_occurred = self.merge(others, merge_conditions)
         return merging_occurred
 
     #
@@ -233,52 +325,121 @@ class SimSolver(SimStatePlugin):
         else:
             return constraints.__class__((self._adjust_constraint(self.And(*constraints)),))
 
-    @auto_actions
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def eval_to_ast(self, e, n, extra_constraints=(), exact=None):
+        """
+        Evaluate an expression, using the solver if necessary. Returns AST objects.
+
+        :param e: the expression
+        :param n: the number of desired solutions
+        :param extra_constraints: extra constraints to apply to the solver
+        :param exact: if False, returns approximate solutions
+        :return: a tuple of the solutions, in the form of claripy AST nodes
+        :rtype: tuple
+        """
         return self._solver.eval_to_ast(e, n, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @concrete_path_tuple
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def eval(self, e, n, extra_constraints=(), exact=None):
+        """
+        Evaluate an expression, using the solver if necessary. Returns primitives.
+
+        :param e: the expression
+        :param n: the number of desired solutions
+        :param extra_constraints: extra constraints to apply to the solver
+        :param exact: if False, returns approximate solutions
+        :return: a tuple of the solutions, in the form of Python primitives
+        :rtype: tuple
+        """
         return self._solver.eval(e, n, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @concrete_path_scalar
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def max(self, e, extra_constraints=(), exact=None):
+        if exact is False and o.VALIDATE_APPROXIMATIONS in self.state.options:
+            ar = self._solver.max(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=False)
+            er = self._solver.max(e, extra_constraints=self._adjust_constraint_list(extra_constraints))
+            assert er <= ar
+            return ar
         return self._solver.max(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @concrete_path_scalar
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def min(self, e, extra_constraints=(), exact=None):
+        if exact is False and o.VALIDATE_APPROXIMATIONS in self.state.options:
+            ar = self._solver.min(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=False)
+            er = self._solver.min(e, extra_constraints=self._adjust_constraint_list(extra_constraints))
+            assert ar <= er
+            return ar
         return self._solver.min(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def solution(self, e, v, extra_constraints=(), exact=None):
+        if exact is False and o.VALIDATE_APPROXIMATIONS in self.state.options:
+            ar = self._solver.solution(e, v, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=False)
+            er = self._solver.solution(e, v, extra_constraints=self._adjust_constraint_list(extra_constraints))
+            if er is True:
+                assert ar is True
+            return ar
         return self._solver.solution(e, v, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @concrete_path_bool
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def is_true(self, e, extra_constraints=(), exact=None):
+        if exact is False and o.VALIDATE_APPROXIMATIONS in self.state.options:
+            ar = self._solver.is_true(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=False)
+            er = self._solver.is_true(e, extra_constraints=self._adjust_constraint_list(extra_constraints))
+            if er is False:
+                assert ar is False
+            return ar
         return self._solver.is_true(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @concrete_path_not_bool
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def is_false(self, e, extra_constraints=(), exact=None):
+        if exact is False and o.VALIDATE_APPROXIMATIONS in self.state.options:
+            ar = self._solver.is_false(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=False)
+            er = self._solver.is_false(e, extra_constraints=self._adjust_constraint_list(extra_constraints))
+            if er is False:
+                assert ar is False
+            return ar
         return self._solver.is_false(e, extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def solve(self, extra_constraints=(), exact=None):
         return self._solver.solve(extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def satisfiable(self, extra_constraints=(), exact=None):
+        if exact is False and o.VALIDATE_APPROXIMATIONS in self.state.options:
+            er = self._solver.satisfiable(extra_constraints=self._adjust_constraint_list(extra_constraints))
+            ar = self._solver.satisfiable(extra_constraints=self._adjust_constraint_list(extra_constraints), exact=False)
+            if er is True:
+                assert ar is True
+            return ar
         return self._solver.satisfiable(extra_constraints=self._adjust_constraint_list(extra_constraints), exact=exact)
 
-    @auto_actions
+    @timed_function
+    @ast_stripping_decorator
     @error_converter
     def add(self, *constraints):
         cc = self._adjust_constraint_list(constraints)
@@ -288,47 +449,52 @@ class SimSolver(SimStatePlugin):
     # And some convenience stuff
     #
 
-    def any_int(self, e, extra_constraints=()):
-        ans = self.any_n_int(e, 1, extra_constraints=extra_constraints)
+    @concrete_path_scalar
+    def any_int(self, e, **kwargs):
+        ans = self.eval(e, 1, **kwargs)
         if len(ans) > 0: return ans[0]
         else: raise SimUnsatError("Not satisfiable: %s" % e.shallow_repr())
 
-    def any_str(self, e, extra_constraints=()):
-        ans = self.any_n_str(e, 1, extra_constraints=extra_constraints)
+    def any_str(self, e, **kwargs):
+        ans = self.any_n_str(e, 1, **kwargs)
         if len(ans) > 0: return ans[0]
         else: raise SimUnsatError("Not satisfiable: %s" % e.shallow_repr())
 
-    def any_n_str_iter(self, e, n, extra_constraints=(), exact=None):
-        for s in self.eval(e, n, extra_constraints=extra_constraints, exact=exact):
+    def any_n_str_iter(self, e, n, **kwargs):
+        if len(e) == 0:
+            yield ""
+            return
+
+        for s in self.eval(e, n, **kwargs):
             yield ("%x" % s).zfill(len(e)/4).decode('hex')
 
-    def any_n_str(self, e, n, extra_constraints=(), exact=None):
-        return list(self.any_n_str_iter(e, n, extra_constraints=extra_constraints, exact=exact))
+    def any_n_str(self, e, n, **kwargs):
+        return list(self.any_n_str_iter(e, n, **kwargs))
 
     min_int = min
     max_int = max
 
-    def any_n_int(self, e, n, extra_constraints=(), exact=None):
+    def any_n_int(self, e, n, **kwargs):
         try:
-            return list(self.eval(e, n, extra_constraints=extra_constraints, exact=exact))
+            return list(self.eval(e, n, **kwargs))
         except SimUnsatError:
             return [ ]
 
-    def exactly_n(self, e, n, extra_constraints=(), exact=None):
-        r = self.any_n_int(e, n, extra_constraints=extra_constraints, exact=exact)
+    def exactly_n(self, e, n, **kwargs):
+        r = self.any_n_int(e, n, **kwargs)
         if len(r) != n:
             raise SimValueError("concretized %d values (%d required) in exactly_n" % (len(r), n))
         return r
 
-    def exactly_n_int(self, e, n, extra_constraints=(), exact=None):
-        r = self.any_n_int(e, n, extra_constraints=extra_constraints, exact=exact)
+    def exactly_n_int(self, e, n, **kwargs):
+        r = self.any_n_int(e, n, **kwargs)
         if len(r) != n:
             raise SimValueError("concretized %d values (%d required) in exactly_n" % (len(r), n))
         return r
 
-    def exactly_int(self, e, extra_constraints=(), default=None, exact=None):
+    def exactly_int(self, e, default=None, **kwargs):
         try:
-            r = self.any_n_int(e, 1, extra_constraints=extra_constraints, exact=exact)
+            r = self.any_n_int(e, 1, **kwargs)
         except (SimValueError, SimSolverModeError):
             if default is not None:
                 return default
@@ -341,8 +507,9 @@ class SimSolver(SimStatePlugin):
                 return default
         return r[0]
 
-    @auto_actions
-    def unique(self, e, extra_constraints=(), exact=None):
+    @timed_function
+    @ast_stripping_decorator
+    def unique(self, e, **kwargs):
         if not isinstance(e, claripy.ast.Base):
             return True
 
@@ -350,7 +517,7 @@ class SimSolver(SimStatePlugin):
         if o.SYMBOLIC not in self.state.options and self.symbolic(e):
             return False
 
-        r = self.any_n_int(e, 2, extra_constraints=extra_constraints, exact=exact)
+        r = self.any_n_int(e, 2, **kwargs)
         if len(r) == 1:
             self.add(e == r[0])
             return True
@@ -375,15 +542,25 @@ class SimSolver(SimStatePlugin):
             # All symbolic expressions are not single-valued
             return not self.symbolic(e)
 
-    @auto_actions
-    @error_converter
     def simplify(self, *args):
         if len(args) == 0:
             return self._solver.simplify()
-        elif isinstance(args[0], claripy.ast.Base):
-            return claripy.simplify(args[0])
-        else:
+        elif isinstance(args[0], (int, long, float, bool)):
             return args[0]
+        elif isinstance(args[0], claripy.ast.Base) and args[0].op in claripy.operations.leaf_operations_concrete:
+            return args[0]
+        elif isinstance(args[0], SimActionObject) and args[0].op in claripy.operations.leaf_operations_concrete:
+            return args[0].ast
+        elif not isinstance(args[0], (SimActionObject, claripy.ast.Base)):
+            return args[0]
+        else:
+            return self._claripy_simplify(*args)
+
+    @timed_function
+    @ast_stripping_decorator
+    @error_converter
+    def _claripy_simplify(self, *args): #pylint:disable=no-self-use
+        return claripy.simplify(args[0])
 
     def variables(self, e): #pylint:disable=no-self-use
         return e.variables

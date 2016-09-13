@@ -88,7 +88,7 @@ class SimIRExpr(object):
 
     # Concretize this expression
     def make_concrete(self):
-        concrete_value = self.state.se.any_int(self.expr)
+        concrete_value = self.state.se.BVV(self.state.se.any_int(self.expr), self.expr.size())
         self._constraints.append(self.expr == concrete_value)
         self.state.add_constraints(self.expr == concrete_value)
         self.expr = concrete_value
@@ -100,7 +100,7 @@ class SimIRExpr(object):
         if len(self.actions) == 0 or o.ACTION_DEPS not in self.state.options:
             return _nonset
         else:
-            return frozenset.union(*[r.reg_deps for r in self.actions if type(r) == SimActionData])
+            return frozenset.union(*[r.reg_deps for r in self.actions if type(r) in (SimActionData, SimActionOperation)])
 
     def tmp_deps(self):
         """
@@ -109,11 +109,11 @@ class SimIRExpr(object):
         if len(self.actions) == 0 or o.ACTION_DEPS not in self.state.options:
             return _nonset
         else:
-            return frozenset.union(*[r.tmp_deps for r in self.actions if type(r) == SimActionData])
+            return frozenset.union(*[r.tmp_deps for r in self.actions if type(r) in (SimActionData, SimActionOperation)])
 
 from .. import size_bits
 from ... import s_options as o
 from ...plugins.inspect import BP_AFTER, BP_BEFORE
 from ...s_errors import SimExpressionError
-from ...s_action import SimActionData
+from ...s_action import SimActionData, SimActionOperation
 from . import translate_expr

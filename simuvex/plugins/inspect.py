@@ -19,6 +19,9 @@ event_types = {
     'exit',
     'symbolic_variable',
     'call',
+    'syscall',
+    'path_step',
+    'cfg_handle_entry',
 }
 
 inspect_attributes = {
@@ -61,13 +64,13 @@ inspect_attributes = {
     'symbolic_expr',
 
     'address_concretization_strategy',
-    'address_concretization_limit',
-    'address_concretization_approx_limit',
     'address_concretization_action',
-    'address_concretization_memory_id',
+    'address_concretization_memory',
     'address_concretization_expr',
     'address_concretization_result',
     'address_concretization_add_constraints',
+
+    'syscall_name'
     }
 
 BP_BEFORE = 'before'
@@ -226,7 +229,9 @@ class SimInspector(SimStatePlugin):
         :return:            The created breakpoint.
         """
         if event_type not in event_types:
-            raise ValueError("Invalid event type %s passed in. Should be one of: %s" % (event_type, event_types))
+            raise ValueError("Invalid event type %s passed in. Should be one of: %s" % (event_type,
+                                                                                        ", ".join(event_types))
+                             )
         self._breakpoints[event_type].append(bp)
 
     def remove_breakpoint(self, event_type, bp):
@@ -263,7 +268,7 @@ class SimInspector(SimStatePlugin):
             if hasattr(self, k):
                 setattr(self, k, None)
 
-    def merge(self, others, merge_flag, merge_values): # pylint: disable=unused-argument
+    def _combine(self, others):
         for t in event_types:
             seen = { id(e) for e in self._breakpoints[t] }
             for o in others:
@@ -271,9 +276,12 @@ class SimInspector(SimStatePlugin):
                     if id(b) not in seen:
                         self._breakpoints[t].append(b)
                         seen.add(id(b))
-        return False, [ ]
+        return False
 
-    def widen(self, others, merge_flag, flag_values):
-        return self.merge(others, merge_flag, flag_values)
+    def merge(self, others, merge_conditions):
+        return self._combine(others)
+
+    def widen(self, others):
+        return self._combine(others)
 
 SimInspector.register_default('inspector', SimInspector)

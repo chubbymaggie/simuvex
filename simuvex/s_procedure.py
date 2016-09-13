@@ -2,23 +2,28 @@
 
 import inspect
 import itertools
-import pyvex
-import claripy
+import types
 import logging
 l = logging.getLogger(name = "simuvex.s_procedure")
 
 symbolic_count = itertools.count()
 
+import pyvex
+import claripy
+
 from .s_run import SimRun
 from .s_cc import DefaultCC
+from .plugins.inspect import BP_BEFORE, BP_AFTER
 
 class SimProcedure(SimRun):
     ADDS_EXITS = False
     NO_RET = False
+    IS_SYSCALL = False
 
     local_vars = ()
 
-    def __init__(self, state, ret_to=None, stmt_from=None, convention=None, arguments=None, sim_kwargs=None, run_func_name='run', **kwargs):
+    def __init__(self, state, ret_to=None, stmt_from=None, convention=None, arguments=None, sim_kwargs=None,
+                 run_func_name='run', syscall_name=None, force_bbl_addr=None, **kwargs):
         self.kwargs = { } if sim_kwargs is None else sim_kwargs
         SimRun.__init__(self, state, **kwargs)
 
@@ -27,8 +32,9 @@ class SimProcedure(SimRun):
         old_sim_procedure = self.state.scratch.sim_procedure
 
         # Update state.scratch
-        self.state.scratch.bbl_addr = self.addr
+        self.state.scratch.bbl_addr = self.addr if force_bbl_addr is None else force_bbl_addr
         self.state.scratch.sim_procedure = self.__class__.__name__
+        self.state.scratch.executed_block_count = 1
 
         self.stmt_from = -1 if stmt_from is None else stmt_from
         self.arguments = arguments
@@ -48,7 +54,7 @@ class SimProcedure(SimRun):
         # NO_RET flag, for overriding the default NO_RET flag set by the SimProcedure itself
         # None - no overriding, respect the default flag
         # True - the same as NO_RET == True
-        # Fasle - the same as NO_RET == False
+        # False - the same as NO_RET == False
         self.overriding_no_ret = None
 
         # prepare and run!
@@ -64,7 +70,7 @@ class SimProcedure(SimRun):
         args = [ self.arg(_) for _ in xrange(num_args) ]
 
         run_func = getattr(self, run_func_name)
-        r = run_func(*args, **self.kwargs)
+        r = self._run(run_func, *args, syscall_name=syscall_name, **self.kwargs)
 
         if (self.overriding_no_ret is False) or \
                 (self.overriding_no_ret is None and not self.NO_RET):
@@ -81,6 +87,41 @@ class SimProcedure(SimRun):
             # If this is an inlined call, restore old scratch members
             self.state.scratch.bbl_addr = old_bbl_addr
             self.state.scratch.sim_procedure = old_sim_procedure
+
+        self.cleanup()
+
+    def _run(self, run_func, *args, **kwargs):
+
+        if self.IS_SYSCALL:
+            if len(self.state.posix.queued_syscall_returns):
+                override = self.state.posix.queued_syscall_returns.pop(0)
+                if override is None:
+                    pass
+                elif isinstance(override, types.FunctionType):
+                    try:
+                        override(self.state, run=self)
+                    except TypeError:
+                        override(self.state)
+                    self.overriding_no_ret = False
+                    return
+                else:
+                    self.overriding_no_ret = False
+                    return override
+
+        syscall_name = kwargs.pop("syscall_name", None)
+
+        if self.IS_SYSCALL:
+            self.state._inspect('syscall', BP_BEFORE, syscall_name=syscall_name)
+
+        if self.IS_SYSCALL:
+            self.state.scratch.executed_syscall_count = 1
+
+        r = run_func(*args, **kwargs)
+
+        if self.IS_SYSCALL:
+            self.state._inspect('syscall', BP_AFTER, syscall_name=syscall_name)
+
+        return r
 
     def run(self, *args, **kwargs): #pylint:disable=unused-argument
         raise SimProcedureError("%s does not implement a run() method" % self.__class__.__name__)
@@ -116,14 +157,27 @@ class SimProcedure(SimRun):
             self.cc = convention
 
     def set_args(self, args):
-        self.cc.set_args(self.state, args)
+        arg_session = self.cc.arg_session
+        for arg in args:
+            if self.cc.is_fp_value(args):
+                arg_session.next_arg(True).set_value(self.state, arg)
+            else:
+                arg_session.next_arg(False).set_value(self.state, arg)
 
-    # Returns a bitvector expression representing the nth argument of a function
-    def arg(self, index):
+    def arg(self, i):
+        """
+        Returns the ith argument. Raise a SimProcedureArgumentError if we don't have such an argument available.
+
+        :param int i: The index of the argument to get
+        :return: The argument
+        :rtype: object
+        """
         if self.arguments is not None:
-            r = self.arguments[index]
+            if i >= len(self.arguments):
+                raise SimProcedureArgumentError("Argument %d does not exist." % i)
+            r = self.arguments[i]
         else:
-            r = self.cc.arg(self.state, index)
+            r = self.cc.arg(self.state, i)
 
         l.debug("returning argument")
         return r
@@ -154,7 +208,7 @@ class SimProcedure(SimRun):
             self.ret_expr = expr
             return
         else:
-            self.cc.set_return_expr(self.state, expr)
+            self.cc.return_val.set_value(self.state, expr)
 
     # Adds an exit representing the function returning. Modifies the state.
     def ret(self, expr=None):
@@ -179,7 +233,7 @@ class SimProcedure(SimRun):
 
                 self.addr = addrs[0]
 
-            ret_irsb = pyvex.IRSB(arch=self.state.arch, bytes=self.state.arch.ret_instruction, mem_addr=self.addr)
+            ret_irsb = pyvex.IRSB(self.state.arch.ret_instruction, self.addr, self.state.arch)
             ret_simirsb = SimIRSB(self.state, ret_irsb, inline=True, addr=self.addr)
             if not ret_simirsb.flat_successors + ret_simirsb.unsat_successors:
                 ret_state = ret_simirsb.default_exit
@@ -190,7 +244,7 @@ class SimProcedure(SimRun):
                 self.state.options.add(o.AST_DEPS)
                 self.state.options.add(o.AUTO_REFS)
 
-            self._add_successor(ret_state, ret_state.scratch.target)
+            self._add_successor_state(ret_state, ret_state.scratch.target)
 
     def call(self, addr, args, continue_at, cc=None):
         if cc is None:
@@ -202,7 +256,7 @@ class SimProcedure(SimRun):
         else:
             ret_addr = self.state.se.BVV(self.state.procedure_data.hook_addr, self.state.arch.bits)
         saved_local_vars = zip(self.local_vars, map(lambda name: getattr(self, name), self.local_vars))
-        simcallstack_entry = (self.__class__, continue_at, cc.stack_space(self.state, args), saved_local_vars, self.kwargs)
+        simcallstack_entry = (self.__class__, continue_at, cc.stack_space(args), saved_local_vars, self.kwargs)
         cc.setup_callsite(call_state, ret_addr, args)
         call_state.procedure_data.callstack.append(simcallstack_entry)
 
@@ -231,16 +285,40 @@ class SimProcedure(SimRun):
         if isinstance(exit_code, (int, long)):
             exit_code = self.state.se.BVV(exit_code, self.state.arch.bits)
         self.state.log.add_event('terminate', exit_code=exit_code)
-        self.add_successor(self.state, self.state.ip, self.state.se.true, 'Ijk_Exit')
+        self.add_successor(self.state, self.state.regs.ip, self.state.se.true, 'Ijk_Exit')
 
     def ty_ptr(self, ty):
         return SimTypePointer(self.state.arch, ty)
 
-    def __repr__(self):
-        if self._custom_name is not None:
-            return "<SimProcedure %s>" % self._custom_name
+    @classmethod
+    def static_exits(cls, arch, blocks):  # pylint: disable=unused-argument
+        """
+        Get new exits by performing static analysis and heuristics. This is a fast and best-effort approach to get new
+        exits for scenarios where states are not available (e.g. when building a fast CFG).
+
+        :param arch: Architecture of the current project.
+        :param list blocks: Blocks that are executed before reaching this SimProcedure.
+        :return: A list of tuples. Each tuple is (address, jumpkind).
+        :rtype: list
+        """
+
+        if cls.ADDS_EXITS:
+            raise SimProcedureError("static_exits() is not implemented for SimProcedure %s" % cls.__name__)
+
         else:
-            return "<SimProcedure %s>" % self.__class__.__name__
+            # This SimProcedure does not add any new exit
+            return [ ]
+
+    def __repr__(self):
+        if self.IS_SYSCALL:
+            class_name = "syscall"
+        else:
+            class_name = "SimProcedure"
+
+        if self._custom_name is not None:
+            return "<%s %s>" % (class_name, self._custom_name)
+        else:
+            return "<%s %s>" % (class_name, self.__class__.__name__)
 
 class SimProcedureContinuation(SimProcedure):
     def __new__(cls, state, *args, **kwargs):
@@ -262,7 +340,7 @@ class SimProcedureContinuation(SimProcedure):
         return self
 
 from . import s_options as o
-from .s_errors import SimProcedureError
+from .s_errors import SimProcedureError, SimProcedureArgumentError
 from .vex.irsb import SimIRSB
 from .s_type import SimTypePointer
 from .s_action import SimActionExit

@@ -29,12 +29,16 @@ def test_concretization_strategies():
 
     x = s.se.BVS('x', s.arch.bits)
     s.add_constraints(x >= 1)
+    s.add_constraints(x <= 3)
 
     ss = s.copy()
-    nose.tools.assert_equal(ss.se.any_n_str(ss.memory.load(x, 1), 2), ['B'])
+    nose.tools.assert_equal(tuple(sorted(ss.se.any_n_str(ss.memory.load(x, 1), 10))), ('B', 'C', 'D'))
 
     ss = s.copy()
+    x = s.se.BVS('x', s.arch.bits)
+    s.add_constraints(x >= 1)
     ss.options.add(simuvex.o.CONSERVATIVE_READ_STRATEGY)
+    ss.memory._create_default_read_strategies()
     nose.tools.assert_true('symbolic' in next(iter(ss.memory.load(x, 1).variables)))
 
 #def test_concretization():

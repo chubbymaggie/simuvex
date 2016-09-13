@@ -3,7 +3,7 @@
 import functools
 import itertools
 import contextlib
-#import weakref
+import weakref
 
 import logging
 l = logging.getLogger("simuvex.s_state")
@@ -33,7 +33,7 @@ class SimState(ana.Storable): # pylint: disable=R0904
     """
 
     def __init__(self, arch="AMD64", plugins=None, memory_backer=None, permissions_backer=None, mode=None, options=None,
-                 add_options=None, remove_options=None, special_memory_filler=None):
+                 add_options=None, remove_options=None, special_memory_filler=None, os_name=None):
         # the architecture is used for function simulations (autorets) and the bitness
         if isinstance(arch, str):
             self.arch = arch_from_id(arch)
@@ -72,11 +72,19 @@ class SimState(ana.Storable): # pylint: disable=R0904
                     memory_backer = {'global': memory_backer}
 
                 # TODO: support permissions backer in SimAbstractMemory
-                self.register_plugin('memory', SimAbstractMemory(memory_backer, memory_id="mem"))
+                self.register_plugin('memory', SimAbstractMemory(memory_backer=memory_backer, memory_id="mem"))
+            elif o.FAST_MEMORY in self.options:
+                self.register_plugin('memory', SimFastMemory(memory_backer=memory_backer, memory_id="mem"))
             else:
-                self.register_plugin('memory', SimSymbolicMemory(memory_backer, permissions_backer, memory_id="mem"))
+                self.register_plugin('memory', SimSymbolicMemory(memory_backer=memory_backer, permissions_backer=permissions_backer, memory_id="mem"))
         if not self.has_plugin('registers'):
-            self.register_plugin('registers', SimSymbolicMemory(memory_id="reg", endness=self.arch.register_endness))
+            if o.FAST_REGISTERS in self.options:
+                self.register_plugin('registers', SimFastMemory(memory_id="reg", endness=self.arch.register_endness))
+            else:
+                self.register_plugin('registers', SimSymbolicMemory(memory_id="reg", endness=self.arch.register_endness))
+
+        # OS name
+        self.os_name = os_name
 
         # This is used in static mode as we don't have any constraints there
         self._satisfiable = True
@@ -100,7 +108,13 @@ class SimState(ana.Storable): # pylint: disable=R0904
     def _ana_setstate(self, s):
         ana.Storable._ana_setstate(self, s)
         for p in self.plugins.values():
-            p.set_state(self)
+            p.set_state(self._get_weakref() if not isinstance(p, SimAbstractMemory) else self)
+
+    def _get_weakref(self):
+        return weakref.proxy(self)
+
+    def _get_strongref(self):
+        return self
 
     #
     # Some temporary backwards compatibility
@@ -132,7 +146,16 @@ class SimState(ana.Storable): # pylint: disable=R0904
     def ip(self, val):
         self.regs.ip = val
 
-    # accessors for memory and registers and such
+    #
+    # Plugin accessors
+    #
+
+    def __getattr__(self, v):
+        try:
+            return self.get_plugin(v)
+        except KeyError:
+            raise AttributeError(v)
+
     @property
     def memory(self):
         return self.get_plugin('memory')
@@ -189,6 +212,10 @@ class SimState(ana.Storable): # pylint: disable=R0904
     def uc_manager(self):
         return self.get_plugin('uc_manager')
 
+    @property
+    def unicorn(self):
+        return self.get_plugin('unicorn')
+
     def _inspect(self, *args, **kwargs):
         if self.has_plugin('inspector'):
             self.inspect.action(*args, **kwargs)
@@ -216,8 +243,9 @@ class SimState(ana.Storable): # pylint: disable=R0904
 
     def register_plugin(self, name, plugin):
         #l.debug("Adding plugin %s of type %s", name, plugin.__class__.__name__)
-        plugin.set_state(self)
+        plugin.set_state(self._get_weakref() if not isinstance(plugin, SimAbstractMemory) else self)
         self.plugins[name] = plugin
+        plugin.init_state()
         return plugin
 
     def release_plugin(self, name):
@@ -241,14 +269,25 @@ class SimState(ana.Storable): # pylint: disable=R0904
                 constraints = args
 
             self._inspect('constraints', BP_BEFORE, added_constraints=constraints)
-            self.se.add(*constraints)
+            constraints = self._inspect_getattr("added_constraints", constraints)
+            added = self.se.add(*constraints)
             self._inspect('constraints', BP_AFTER)
 
-        if 'action' in kwargs and kwargs['action'] and o.TRACK_CONSTRAINT_ACTIONS in self.options and len(args) > 0:
-            for arg in args:
-                if self.se.symbolic(arg):
-                    sac = SimActionConstraint(self, arg)
+            # add actions for the added constraints
+            if o.TRACK_CONSTRAINT_ACTIONS in self.options:
+                for c in added:
+                    sac = SimActionConstraint(self, c)
                     self.log.add_action(sac)
+        else:
+            # preserve the old action logic for when we don't track constraints (why?)
+            if (
+                'action' in kwargs and kwargs['action'] and
+                o.TRACK_CONSTRAINT_ACTIONS in self.options and len(args) > 0
+            ):
+                for arg in args:
+                    if self.se.symbolic(arg):
+                        sac = SimActionConstraint(self, arg)
+                        self.log.add_action(sac)
 
         if o.ABSTRACT_SOLVER in self.options and len(args) > 0:
             for arg in args:
@@ -283,7 +322,7 @@ class SimState(ana.Storable): # pylint: disable=R0904
                                 'to Fish and he will fix it if he\'s free.')
                         continue
 
-                    new_expr = original_expr.intersection(constrained_si)
+                    new_expr = constrained_si
                     self.registers.replace_all(original_expr, new_expr)
                     for _, region in self.memory.regions.items():
                         region.memory.replace_all(original_expr, new_expr)
@@ -328,7 +367,7 @@ class SimState(ana.Storable): # pylint: disable=R0904
 
         c_arch = self.arch.copy()
         c_plugins = self._copy_plugins()
-        state = SimState(arch=c_arch, plugins=c_plugins, options=self.options, mode=self.mode)
+        state = SimState(arch=c_arch, plugins=c_plugins, options=self.options, mode=self.mode, os_name=self.os_name)
 
         state.uninitialized_access_handler = self.uninitialized_access_handler
         state._special_memory_filler = self._special_memory_filler
@@ -336,18 +375,31 @@ class SimState(ana.Storable): # pylint: disable=R0904
 
         return state
 
-    def merge(self, *others):
+    def merge(self, *others, **kwargs):
         """
         Merges this state with the other states. Returns the merging result, merged state, and the merge flag.
 
-        :param others: the other states to merge
+        :param states: the states to merge
+        :param merge_conditions: a tuple of the conditions under which each state holds
         :return: (merged state, merge flag, a bool indicating if any merging occured)
         """
-        # TODO: maybe make the length of this smaller? Maybe: math.ceil(math.log(len(others)+1, 2))
-        merge_flag = self.se.BVS("state_merge_%d" % merge_counter.next(), 16)
-        merge_values = range(len(others)+1)
+
+        merge_conditions = kwargs.pop('merge_conditions', None)
+        if len(kwargs) != 0:
+            raise ValueError("invalid arguments: %s" % kwargs.keys())
+
+        if merge_conditions is None:
+            # TODO: maybe make the length of this smaller? Maybe: math.ceil(math.log(len(others)+1, 2))
+            merge_flag = self.se.BVS("state_merge_%d" % merge_counter.next(), 16)
+            merge_values = range(len(others)+1)
+            merge_conditions = [ merge_flag == b for b in merge_values ]
+        else:
+            merge_conditions = [
+                (self.se.true if len(mc) == 0 else self.se.And(*mc)) for mc in merge_conditions
+            ]
 
         if len(set(o.arch.name for o in others)) != 1:
+            import ipdb; ipdb.set_trace()
             raise SimMergeError("Unable to merge due to different architectures.")
 
         all_plugins = set(self.plugins.keys()) | set.union(*(set(o.plugins.keys()) for o in others))
@@ -356,27 +408,34 @@ class SimState(ana.Storable): # pylint: disable=R0904
         merging_occurred = False
 
         # plugins
-        m_constraints = [ ]
         for p in all_plugins:
             our_plugin = merged.plugins[p] if p in merged.plugins else None
             their_plugins = [ (pl.plugins[p] if p in pl.plugins else None) for pl in others ]
 
-            plugin_classes = (set([our_plugin.__class__]) | set(pl.__class__ for pl in their_plugins)) - set([None.__class__])
+            plugin_classes = (
+                set([our_plugin.__class__]) | set(pl.__class__ for pl in their_plugins)
+            ) - set([None.__class__])
             if len(plugin_classes) != 1:
-                raise SimMergeError("There are differing plugin classes (%s) for plugin %s" % (plugin_classes, p))
+                raise SimMergeError(
+                    "There are differing plugin classes (%s) for plugin %s" % (plugin_classes, p)
+                )
             plugin_class = plugin_classes.pop()
 
-            our_filled_plugin = our_plugin if our_plugin is not None else merged.register_plugin(p, plugin_class())
-            their_filled_plugins = [ (tp if tp is not None else t.register_plugin(p, plugin_class())) for t,tp in zip(others, their_plugins) ]
+            our_filled_plugin = our_plugin if our_plugin is not None else merged.register_plugin(
+                p, plugin_class()
+            )
+            their_filled_plugins = [
+                (tp if tp is not None else t.register_plugin(p, plugin_class()))
+                for t,tp in zip(others, their_plugins)
+            ]
 
-            plugin_state_merged, new_constraints = our_filled_plugin.merge(their_filled_plugins, merge_flag, merge_values)
+            plugin_state_merged = our_filled_plugin.merge(their_filled_plugins, merge_conditions)
             if plugin_state_merged:
                 l.debug('Merging occured in %s', p)
                 merging_occurred = True
-            m_constraints += new_constraints
-        merged.add_constraints(*m_constraints)
 
-        return merged, merge_flag, merging_occurred
+        merged.add_constraints(merged.se.Or(*merge_conditions))
+        return merged, merge_conditions, merging_occurred
 
     def widen(self, *others):
         """
@@ -619,6 +678,7 @@ class SimState(ana.Storable): # pylint: disable=R0904
             return conditions.__class__((self._adjust_condition(self.se.And(*conditions)),))
 
 from .plugins.symbolic_memory import SimSymbolicMemory
+from .plugins.fast_memory import SimFastMemory
 from .plugins.abstract_memory import SimAbstractMemory
 from .s_errors import SimMergeError, SimValueError, SimStateError
 from .plugins.inspect import BP_AFTER, BP_BEFORE

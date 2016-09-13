@@ -93,6 +93,12 @@ ABSTRACT_MEMORY = "ABSTRACT_MEMORY"
 AVOID_MULTIVALUED_READS = "AVOID_SYMBOLIC_READS"
 AVOID_MULTIVALUED_WRITES = "AVOID_SYMBOLIC_WRITES"
 
+# This option concretizes symbolically sized writes
+CONCRETIZE_SYMBOLIC_WRITE_SIZES = "CONCRETIZE_SYMBOLIC_WRITE_SIZES"
+
+# This option concretizes the read size if it's symbolic from the file
+CONCRETIZE_SYMBOLIC_FILE_READ_SIZES = "CONCRETIZE_SYMBOLIC_FILE_READ_SIZES"
+
 # This causes angr to support fully symbolic writes. It is very likely that speed will suffer.
 SYMBOLIC_WRITE_ADDRESSES = "SYMBOLIC_WRITE_ADDRESSES"
 
@@ -113,9 +119,15 @@ TRACK_REGISTER_ACTIONS = "TRACK_REGISTER_ACTIONS"
 TRACK_TMP_ACTIONS = "TRACK_TMP_ACTIONS"
 TRACK_JMP_ACTIONS = "TRACK_JMP_ACTIONS"
 TRACK_CONSTRAINT_ACTIONS = "TRACK_CONSTRAINT_ACTIONS"
+# note that TRACK_OP_ACTIONS is not enabled in symbolic mode by default, since Yan is worried about its performance
+# impact. someone should measure it and make a final decision.
+TRACK_OP_ACTIONS = "TRACK_OP_ACTIONS"
 
 # track the history of actions through a path (multiple states). This action affects things on the angr level
 TRACK_ACTION_HISTORY = "TRACK_ACTION_HISTORY"
+
+# track memory mapping and permissions
+TRACK_MEMORY_MAPPING = "TRACK_MEMORY_MAPPING"
 
 # this is an internal option to automatically track dependencies in SimProcedures
 AUTO_REFS = "AUTO_REFS"
@@ -127,6 +139,9 @@ ACTION_DEPS = "ACTION_DEPS"
 # This enables the tracking of reverse mappings (name->addr and hash->addr) in SimSymbolicMemory
 REVERSE_MEMORY_NAME_MAP = "REVERSE_MEMORY_NAME_MAP"
 REVERSE_MEMORY_HASH_MAP = "REVERSE_MEMORY_HASH_MAP"
+
+# This enables tracking of which bytes in the state are symbolic
+MEMORY_SYMBOLIC_BYTES_MAP = "MEMORY_SYMBOLIC_BYTES_MAP"
 
 # this makes s_run() copy states
 COW_STATES = "COW_STATES"
@@ -152,11 +167,34 @@ DOWNSIZE_Z3 = "DOWNSIZE_Z3"
 # Concretize certain registers if they're unique
 CONCRETIZE_UNIQUE_REGS = "CONCRETIZE_UNIQUE_REGS"
 
+# initialize all registers to 0 when creating the state
+INITIALIZE_ZERO_REGISTERS = "INITIALIZE_ZERO_REGISTERS"
+
 # Turn-on superfastpath mode
 SUPER_FASTPATH = "SUPER_FASTPATH"
 
+# use FastMemory for memory
+FAST_MEMORY = "FAST_MEMORY"
+
+# use FastMemory for registers
+FAST_REGISTERS = "FAST_REGISTERS"
+
 # Under-constrained symbolic execution
 UNDER_CONSTRAINED_SYMEXEC = "UNDER_CONSTRAINED_SYMEXEC"
+
+# enable unicorn engine
+UNICORN = "UNICORN"
+UNICORN_ZEROPAGE_GUARD = "UNICORN_ZEROPAGE_GUARD"
+UNICORN_SYM_REGS_SUPPORT = "UNICORN_SYM_REGS_SUPPORT"
+
+# concretize symbolic data when we see it "too often"
+UNICORN_THRESHOLD_CONCRETIZATION = "UNICORN_THRESHOLD_CONCRETIZATION"
+
+# aggressively concretize symbolic data when we see it in unicorn
+UNICORN_AGGRESSIVE_CONCRETIZATION = "UNICORN_AGGRESSIVE_CONCRETIZATION"
+
+# floating point support
+SUPPORT_FLOATING_POINT = "SUPPORT_FLOATING_POINT"
 
 # Resilience options
 BYPASS_UNSUPPORTED_IROP = "BYPASS_UNSUPPORTED_IROP"
@@ -167,6 +205,7 @@ BYPASS_UNSUPPORTED_IRDIRTY = "BYPASS_UNSUPPORTED_IRDIRTY"
 BYPASS_UNSUPPORTED_IRCCALL = "BYPASS_UNSUPPORTED_IRCCALL"
 BYPASS_ERRORED_IRCCALL = "BYPASS_ERRORED_IRCCALL"
 BYPASS_UNSUPPORTED_SYSCALL = "BYPASS_UNSUPPORTED_SYSCALL"
+UNSUPPORTED_BYPASS_ZERO_DEFAULT = "UNSUPPORTED_BYPASS_ZERO_DEFAULT"
 
 FRESHNESS_ANALYSIS = 'FRESHNESS_ANALYSIS'
 UNINITIALIZED_ACCESS_AWARENESS = 'UNINITIALIZED_ACCESS_AWARENESS'
@@ -181,6 +220,9 @@ APPROXIMATE_MEMORY_INDICES = "APPROXIMAGE_MEMORY_INDICES"
 # use an experimental replacement solver
 REPLACEMENT_SOLVER = "REPLACEMENT_SOLVER"
 
+# use a cache-less solver in claripy
+CACHELESS_SOLVER = "CACHELESS_SOLVER"
+
 # IR optimization
 OPTIMIZE_IR = "OPTIMIZE_IR"
 
@@ -188,6 +230,14 @@ SPECIAL_MEMORY_FILL = "SPECIAL_MEMORY_FILL"
 
 # using this option the value inside the register ip is keeped symbolic
 KEEP_IP_SYMBOLIC = "KEEP_IP_SYMBOLIC"
+
+# Do not union values from different locations when reading from the memory for a reduced loss in precision
+# It is only applied to SimAbstractMemory
+KEEP_MEMORY_READS_DISCRETE = "KEEP_MEMORY_READS_DISCRETE"
+
+# Raise a SigSegfaultError on illegal memory accesses
+STRICT_PAGE_ACCESS = "STRICT_PAGE_ACCESS"
+
 #
 # CGC specific state options
 #
@@ -197,18 +247,21 @@ CGC_ZERO_FILL_UNCONSTRAINED_MEMORY = 'CGC_ZERO_FILL_UNCONSTRAINED_MEMORY'
 # Make sure the receive syscall always read as many bytes as the program wants
 CGC_NO_SYMBOLIC_RECEIVE_LENGTH = 'CGC_NO_SYMBOLIC_RECEIVE_LENGTH'
 BYPASS_VERITESTING_EXCEPTIONS = 'BYPASS_VERITESTING_EXCEPTIONS'
+# Make sure filedescriptors on transmit and recieve are always 1 and 0
+CGC_ENFORCE_FD = 'CGC_ENFORCE_FD'
 
 # useful sets of options
 resilience_options = { BYPASS_UNSUPPORTED_IROP, BYPASS_UNSUPPORTED_IREXPR, BYPASS_UNSUPPORTED_IRSTMT, BYPASS_UNSUPPORTED_IRDIRTY, BYPASS_UNSUPPORTED_IRCCALL, BYPASS_ERRORED_IRCCALL, BYPASS_UNSUPPORTED_SYSCALL, BYPASS_ERRORED_IROP, BYPASS_VERITESTING_EXCEPTIONS }
 refs = { TRACK_REGISTER_ACTIONS, TRACK_MEMORY_ACTIONS, TRACK_TMP_ACTIONS, TRACK_JMP_ACTIONS, ACTION_DEPS, TRACK_CONSTRAINT_ACTIONS }
 approximation = { APPROXIMATE_SATISFIABILITY, APPROXIMATE_MEMORY_SIZES, APPROXIMATE_MEMORY_INDICES }
-symbolic = { DO_CCALLS, SYMBOLIC, TRACK_CONSTRAINTS, LAZY_SOLVES, SYMBOLIC_INITIAL_VALUES }
-simplification = { SIMPLIFY_MEMORY_WRITES, SIMPLIFY_EXIT_STATE, SIMPLIFY_EXIT_GUARD, SIMPLIFY_REGISTER_WRITES }
-common_options_without_simplification = { DO_GETS, DO_PUTS, DO_LOADS, DO_OPS, COW_STATES, DO_STORES, OPTIMIZE_IR }
+symbolic = { DO_CCALLS, SYMBOLIC, TRACK_CONSTRAINTS, LAZY_SOLVES, SYMBOLIC_INITIAL_VALUES, COMPOSITE_SOLVER }
+simplification = { SIMPLIFY_MEMORY_WRITES, SIMPLIFY_REGISTER_WRITES }
+common_options_without_simplification = { DO_GETS, DO_PUTS, DO_LOADS, DO_OPS, COW_STATES, DO_STORES, OPTIMIZE_IR, TRACK_MEMORY_MAPPING, SUPPORT_FLOATING_POINT }
 common_options = common_options_without_simplification | simplification
+unicorn = { UNICORN, UNICORN_SYM_REGS_SUPPORT, INITIALIZE_ZERO_REGISTERS }
 
 modes = { }
 modes['symbolic'] = common_options | symbolic | refs #| approximation | { VALIDATE_APPROXIMATIONS }
 modes['symbolic_approximating'] = common_options | symbolic | refs | approximation
 modes['static'] = common_options_without_simplification | refs | { BEST_EFFORT_MEMORY_STORING, UNINITIALIZED_ACCESS_AWARENESS, SYMBOLIC_INITIAL_VALUES, DO_CCALLS, DO_RET_EMULATION, TRUE_RET_EMULATION_GUARD, BLOCK_SCOPE_CONSTRAINTS, TRACK_CONSTRAINTS, ABSTRACT_MEMORY, ABSTRACT_SOLVER, USE_SIMPLIFIED_CCALLS, REVERSE_MEMORY_NAME_MAP }
-modes['fastpath'] = ((modes['symbolic'] | { BEST_EFFORT_MEMORY_STORING, AVOID_MULTIVALUED_READS, AVOID_MULTIVALUED_WRITES, IGNORE_EXIT_GUARDS, SYMBOLIC_INITIAL_VALUES, DO_RET_EMULATION } | resilience_options) - simplification - approximation) - { SYMBOLIC, DO_CCALLS }
+modes['fastpath'] = ((modes['symbolic'] | { TRACK_OP_ACTIONS, BEST_EFFORT_MEMORY_STORING, AVOID_MULTIVALUED_READS, AVOID_MULTIVALUED_WRITES, IGNORE_EXIT_GUARDS, SYMBOLIC_INITIAL_VALUES, DO_RET_EMULATION, NO_SYMBOLIC_JUMP_RESOLUTION, FAST_REGISTERS } | resilience_options) - simplification - approximation) - { SYMBOLIC, DO_CCALLS }

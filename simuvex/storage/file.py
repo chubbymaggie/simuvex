@@ -1,5 +1,6 @@
 from ..plugins.plugin import SimStatePlugin
 from ..s_action_object import SimActionObject
+from .. import s_options
 
 import claripy
 import logging
@@ -85,9 +86,9 @@ class SimFile(SimStatePlugin):
         self.content.set_state(st)
 
     def variables(self):
-        '''
+        """
         :return: the symbolic variable names associated with the file.
-        '''
+        """
         return self.content.mem._name_mapping.keys()
 
     def close(self):
@@ -103,16 +104,36 @@ class SimFile(SimStatePlugin):
         :param length:      The length of the read.
         :return:            The length of the read.
         """
-        # TODO: check file close status
-        read_length = length
+
+        orig_length = length
+        real_length = length
+        max_length = length
+
         if self.size is not None:
-            remaining = self.size - self.pos
-            read_length = self.state.se.If(remaining < length, remaining, length)
+            max_length = self.size - self.pos
 
-        self.content.copy_contents(dst_addr, self.pos, read_length , dst_memory=self.state.memory)
+        # TODO: check file close status
 
-        self.read_pos += _deps_unpack(read_length)[0]
-        return read_length
+        # check if we need to concretize the length
+        if (
+            s_options.CONCRETIZE_SYMBOLIC_FILE_READ_SIZES in self.state.options and
+            (self.state.se.symbolic(orig_length) or self.state.se.symbolic(max_length))
+        ):
+            orig_max = self.state.se.max_int(orig_length)
+            self.state.add_constraints(orig_length == orig_max)
+            real_length = min(orig_max, self.state.se.max_int(max_length))
+
+        if self.size is not None:
+            length_constraint = self.pos + real_length <= self.size
+            if (self.state.se.symbolic(real_length) or self.state.se.symbolic(max_length)) and \
+                    self.state.se.satisfiable(extra_constraints=(length_constraint,)):
+                self.state.add_constraints(length_constraint)
+            elif not self.state.se.symbolic(real_length) or not self.state.se.symbolic(max_length):
+                real_length = min(self.state.se.any_int(max_length), self.state.se.any_int(real_length))
+
+        self.content.copy_contents(dst_addr, self.pos, real_length , dst_memory=self.state.memory)
+        self.read_pos += _deps_unpack(real_length)[0]
+        return real_length
 
     def read_from(self, length):
 
@@ -151,7 +172,7 @@ class SimFile(SimStatePlugin):
     def all_bytes(self):
         indexes = self.content.mem.keys()
         if len(indexes) == 0:
-            raise SimFileError('no content in file %s' % self.name)
+            return self.state.se.BVV("")
 
         min_idx = min(indexes)
         max_idx = max(indexes)
@@ -160,7 +181,7 @@ class SimFile(SimStatePlugin):
             buff.append(self.content.load(i, 1))
         return self.state.se.Concat(*buff)
 
-    def merge(self, others, merge_flag, flag_values):
+    def merge(self, others, merge_conditions):
         """
         Merges the SimFile object with `others`.
         """
@@ -192,7 +213,7 @@ class SimFile(SimStatePlugin):
         #if len(set(o.mode for o in all_files)) > 1:
         #   raise SimMergeError("merging modes is not yet supported (TODO)")
 
-        return self.content.merge([ o.content for o in others ], merge_flag, flag_values)
+        return self.content.merge([ o.content for o in others ], merge_conditions)
 
 class SimDialogue(SimFile):
     """
@@ -266,4 +287,4 @@ class SimDialogue(SimFile):
         return SimDialogue(self.name, mode=self.mode, pos=self.pos, content=self.content.copy(), size=self.size, dialogue_entries=list(self.dialogue_entries))
 
 from ..plugins.symbolic_memory import SimSymbolicMemory
-from ..s_errors import SimMergeError, SimFileError
+from ..s_errors import SimMergeError

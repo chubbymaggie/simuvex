@@ -97,6 +97,72 @@ def test_inspect():
     s.memory.load(0, 10)
     nose.tools.assert_equals(counts.variables, 1)
 
+
+def test_inspect_exit():
+    class counts: #pylint:disable=no-init
+        exit_before = 0
+        exit_after = 0
+
+    def handle_exit_before(state):
+        counts.exit_before += 1
+        exit_target = state.inspect.exit_target
+        nose.tools.assert_equal(state.se.any_int(exit_target), 0x3f8)
+        # change exit target
+        state.inspect.exit_target = 0x41414141
+        nose.tools.assert_equal(state.inspect.exit_jumpkind, "Ijk_Boring")
+        nose.tools.assert_true(state.inspect.exit_guard.is_true())
+
+    def handle_exit_after(state): #pylint:disable=unused-argument
+        counts.exit_after += 1
+
+    s = simuvex.SimState(arch="AMD64", mode="symbolic")
+    irsb = pyvex.IRSB("\x90\x90\x90\x90\xeb\x0a", mem_addr=1000, arch=archinfo.ArchAMD64())
+
+    # break on exit
+    s.inspect.b('exit', simuvex.BP_BEFORE, action=handle_exit_before)
+    s.inspect.b('exit', simuvex.BP_AFTER, action=handle_exit_after)
+
+    # step it
+    succ = simuvex.SimIRSB(s, irsb).successors
+
+    # check
+    nose.tools.assert_equal( succ[0].se.any_int(succ[0].ip), 0x41414141)
+    nose.tools.assert_equal(counts.exit_before, 1)
+    nose.tools.assert_equal(counts.exit_after, 1)
+
+
+def test_inspect_syscall():
+    class counts: #pylint:disable=no-init
+        exit_before = 0
+        exit_after = 0
+
+    def handle_syscall_before(state):
+        counts.exit_before += 1
+        syscall_name = state.inspect.syscall_name
+        nose.tools.assert_equal(syscall_name, "close")
+
+    def handle_syscall_after(state):
+        counts.exit_after += 1
+        syscall_name = state.inspect.syscall_name
+        nose.tools.assert_equal(syscall_name, "close")
+
+    s = simuvex.SimState(arch="AMD64", mode="symbolic")
+    # set up to call so syscall close
+    s.regs.rax = 3
+    s.regs.rdi = 2
+
+    # break on syscall
+    s.inspect.b('syscall', simuvex.BP_BEFORE, action=handle_syscall_before)
+    s.inspect.b('syscall', simuvex.BP_AFTER, action=handle_syscall_after)
+
+    # step it
+    simuvex.SimProcedures['syscalls']['close'](s, addr=s.se.any_int(s.ip), ret_to=s.ip, syscall_name='close')
+
+    # check counts
+    nose.tools.assert_equal(counts.exit_before, 1)
+    nose.tools.assert_equal(counts.exit_after, 1)
+
+
 def test_inspect_concretization():
     # some values for the test
     x = claripy.BVS('x', 64)
@@ -140,11 +206,18 @@ def test_inspect_concretization():
 
     def abort_unconstrained(state):
         print state.inspect.address_concretization_strategy, state.inspect.address_concretization_result
-        if state.inspect.address_concretization_strategy == 'symbolic' and state.inspect.address_concretization_result == None:
+        if (
+            isinstance(
+                state.inspect.address_concretization_strategy,
+                simuvex.concretization_strategies.SimConcretizationStrategyRange
+            ) and state.inspect.address_concretization_result is None
+        ):
             raise UnconstrainedAbort("uh oh", state)
 
     s = simuvex.SimState()
-    s.memory._default_write_strategy.insert(0, 'symbolic')
+    s.memory.write_strategies.insert(
+        0, simuvex.concretization_strategies.SimConcretizationStrategyRange(128)
+    )
     s.memory._write_address_range = 1
     s.memory._write_address_range_approx = 1
     s.add_constraints(y == 10)
@@ -161,4 +234,6 @@ def test_inspect_concretization():
 
 if __name__ == '__main__':
     test_inspect_concretization()
+    test_inspect_exit()
+    test_inspect_syscall()
     test_inspect()

@@ -1,11 +1,8 @@
-import ana
-import weakref
-
 default_plugins = { }
 
 # This is a base class for SimState plugins. A SimState plugin will be copied along with the state when the state is branched. They
 # are intended to be used for things such as tracking open files, tracking heap details, and providing storage and persistence for SimProcedures.
-class SimStatePlugin(ana.Storable):
+class SimStatePlugin(object):
     #__slots__ = [ 'state' ]
 
     def __init__(self):
@@ -13,30 +10,29 @@ class SimStatePlugin(ana.Storable):
 
     # Sets a new state (for example, if the state has been branched)
     def set_state(self, state):
-        if state is None or type(state).__name__ == 'weakproxy':
-            self.state = state
-        else:
-            self.state = weakref.proxy(state)
+        self.state = state
+
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        d['state'] = None
+        return d
 
     # Should return a copy of the state plugin.
     def copy(self):
         raise Exception("copy() not implement for %s", self.__class__.__name__)
 
-    def merge(self, others, merge_flag, flag_values): # pylint: disable=W0613
+    def merge(self, others, merge_conditions): #pylint:disable=unused-argument
         """
         Should merge the state plugin with the provided others.
 
-           others - the other state plugin
-           merge_flag - a symbolic expression for the merge flag
-           flag_values - the values to compare against to check which content should be used.
-
-               self.symbolic_content = self.state.se.If(merge_flag == flag_values[0], self.symbolic_content, other.se.symbolic_content)
-
-            Can return a sequence of constraints to be added to the state.
+        :param others: the other state plugin
+        :param merge_conditions: a symbolic condition for each of the plugins
+        :returns: a merged plugin
+        :rtype: SimStatePlugin
         """
         raise Exception("merge() not implement for %s", self.__class__.__name__)
 
-    def widen(self, others, merge_flag, flag_values):
+    def widen(self, others): #pylint:disable=unused-argument
         """
         The widening operation for plugins.
         """
@@ -48,3 +44,6 @@ class SimStatePlugin(ana.Storable):
         if name in default_plugins:
             raise Exception("%s is already set as the default for %s" % (default_plugins[name], name))
         default_plugins[name] = cls
+
+    def init_state(self):
+        pass

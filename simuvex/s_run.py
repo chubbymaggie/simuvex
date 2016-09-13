@@ -2,9 +2,14 @@
 
 import logging
 l = logging.getLogger("simuvex.s_run")
+
 import claripy
-import simuvex.s_options as o
 from claripy.ast.bv import BV
+
+from . import s_options as o
+from .plugins.inspect import BP_BEFORE, BP_AFTER
+from .s_cc import SyscallCC
+from .s_errors import UnsupportedSyscallError
 
 class SimRun(object):
     def __init__(self, state, addr=None, inline=False, custom_name=None):
@@ -44,9 +49,14 @@ class SimRun(object):
             for s in self.successors:
                 s.downsize()
 
-        # now delete the final state; it should be exported in exits
-        if hasattr(self, 'state'):
+        # now delete the final state if the run was not inlined
+        if not self._inline and hasattr(self, 'state'):
             delattr(self, 'state')
+
+        if len(self.flat_successors) == 1 and len(self.unconstrained_successors) == 0:
+            # the exit is unavoidable
+            self.flat_successors[0].scratch.avoidable = False
+
 
     def add_successor(self, state, target, guard, jumpkind, exit_stmt_idx=None, source=None):
         """
@@ -62,6 +72,25 @@ class SimRun(object):
                               and None means it's not from a statement (for example, from a SimProcedure).
         :param source:        The source of the jump (i.e., the address of the basic block).
         """
+
+        state._inspect('exit', BP_BEFORE, exit_target=target, exit_guard=guard, exit_jumpkind=jumpkind)
+        target = state._inspect_getattr("exit_target", target)
+        guard = state._inspect_getattr("exit_guard", guard)
+        jumpkind = state._inspect_getattr("exit_jumpkind", jumpkind)
+
+        #
+        # Simplification
+        #
+
+        if o.SIMPLIFY_EXIT_STATE in self.state.options:
+            state.se.simplify()
+
+        if o.SIMPLIFY_EXIT_GUARD in self.state.options:
+            guard = state.se.simplify(guard)
+
+        if o.SIMPLIFY_EXIT_TARGET in self.state.options:
+            target = state.se.simplify(target)
+
         state.scratch.target = _raw_ast(target)
         state.scratch.jumpkind = jumpkind
         state.scratch.guard = _raw_ast(guard)
@@ -75,9 +104,11 @@ class SimRun(object):
         state.options.discard(o.AST_DEPS)
         state.options.discard(o.AUTO_REFS)
 
-        return self._add_successor(state, target)
+        return_state = self._add_successor_state(state, target)
+        state._inspect('exit', BP_AFTER, exit_target=target, exit_guard=guard, exit_jumpkind=jumpkind)
+        return return_state
 
-    def _add_successor(self, state, target):
+    def _add_successor_state(self, state, target):
         """
         Append state into successor lists.
 
@@ -105,10 +136,37 @@ class SimRun(object):
             self.unsat_successors.append(state)
         elif o.NO_SYMBOLIC_JUMP_RESOLUTION in state.options and state.se.symbolic(target):
             self.unconstrained_successors.append(state.copy())
-        elif not state.se.symbolic(target):
+        elif not state.se.symbolic(target) and not state.scratch.jumpkind.startswith("Ijk_Sys"):
+            # a successor with a concrete IP, and it's not a syscall
             self.successors.append(state)
             self.flat_successors.append(state.copy())
+        elif state.scratch.jumpkind.startswith("Ijk_Sys"):
+            # syscall
+            self.successors.append(state)
+
+            # Misuse the ip_at_syscall register to save the return address for this syscall
+            # state.ip *might be* changed to be the real address of syscall SimProcedures by syscall handling code in
+            # angr
+            state.regs.ip_at_syscall = state.ip
+
+            try:
+                symbolic_syscall_num, concrete_syscall_nums = self._concrete_syscall_numbers(state)
+                if concrete_syscall_nums is not None:
+                    for n in concrete_syscall_nums:
+                        split_state = state.copy()
+                        split_state.add_constraints(symbolic_syscall_num == n)
+
+                        self.flat_successors.append(split_state)
+                else:
+                    # We cannot resolve the syscall number
+                    # However, we still put it to the flat_successors list, and angr.SimOS.handle_syscall will pick it
+                    # up, and create a "unknown syscall" stub for it.
+                    self.flat_successors.append(state)
+            except UnsupportedSyscallError:
+                self.unsat_successors.append(state)
+
         else:
+            # a successor with a symbolic IP
             try:
                 if o.KEEP_IP_SYMBOLIC in state.options:
                     s = claripy.Solver()
@@ -124,7 +182,10 @@ class SimRun(object):
                     addrs = state.se.any_n_int(target, 257)
 
                 if len(addrs) > 256:
-                    l.warning("Exit state has over 257 possible solutions. Likely unconstrained; skipping. %s", target)
+                    l.warning(
+                        "Exit state has over 257 possible solutions. Likely unconstrained; skipping. %s",
+                        target.shallow_repr()
+                    )
                     self.unconstrained_successors.append(state.copy())
                 else:
                     for a in addrs:
@@ -140,6 +201,34 @@ class SimRun(object):
                 self.unsat_successors.append(state)
 
         return state
+
+    @staticmethod
+    def _concrete_syscall_numbers(state):
+
+        if state.os_name in SyscallCC[state.arch.name]:
+            cc = SyscallCC[state.arch.name][state.os_name](state.arch)
+        else:
+            # Use the default syscall calling convention - it may bring problems
+            cc = SyscallCC[state.arch.name]['default'](state.arch)
+
+        syscall_num = cc.syscall_num(state)
+
+        if syscall_num.symbolic and o.NO_SYMBOLIC_SYSCALL_RESOLUTION in state.options:
+            l.debug("Not resolving symbolic syscall number")
+            return syscall_num, None
+        maximum = state.posix.maximum_symbolic_syscalls
+        possible = state.se.any_n_int(syscall_num, maximum + 1)
+
+        if len(possible) == 0:
+            raise UnsupportedSyscallError("Unsatisfiable state attempting to do a syscall")
+
+        if len(possible) > maximum:
+            l.warning("Too many possible syscalls. Concretizing to 1.")
+            possible = possible[:1]
+
+        l.debug("Possible syscall values: %s", possible)
+
+        return syscall_num, possible
 
     @property
     def id_str(self):

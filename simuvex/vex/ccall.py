@@ -372,18 +372,40 @@ def pc_actions_SHR(state, nbits, remaining, shifted, cc_ndep, platform=None):
     of = (remaining[0] ^ shifted[0])[0]
     return pc_make_rdata(data[platform]['size'], cf, pf, af, zf, sf, of, platform=platform)
 
-def pc_actions_ROL(*args, **kwargs):
-    l.error("Unsupported flag action ROL")
-    raise SimCCallError("Unsupported flag action. Please implement or bug Yan.")
-def pc_actions_ROR(*args, **kwargs):
-    l.error("Unsupported flag action ROR")
-    raise SimCCallError("Unsupported flag action. Please implement or bug Yan.")
-def pc_actions_UMUL(*args, **kwargs):
-    l.error("Unsupported flag action UMUL")
-    raise SimCCallError("Unsupported flag action. Please implement or bug Yan.")
+def pc_actions_ROL(state, nbits, res, _, cc_ndep, platform=None):
+    cf = res[0]
+    pf = (cc_ndep & data[platform]['CondBitMasks']['G_CC_MASK_P'])[data[platform]['CondBitOffsets']['G_CC_SHIFT_P']]
+    af = (cc_ndep & data[platform]['CondBitMasks']['G_CC_MASK_A'])[data[platform]['CondBitOffsets']['G_CC_SHIFT_A']]
+    zf = (cc_ndep & data[platform]['CondBitMasks']['G_CC_MASK_Z'])[data[platform]['CondBitOffsets']['G_CC_SHIFT_Z']]
+    sf = (cc_ndep & data[platform]['CondBitMasks']['G_CC_MASK_S'])[data[platform]['CondBitOffsets']['G_CC_SHIFT_S']]
+    of = (state.se.LShR(res, nbits-1) ^ res)[0]
+    return pc_make_rdata(data[platform]['size'], cf, pf, af, zf, sf, of, platform=platform)
+
+def pc_actions_ROR(state, nbits, res, _, cc_ndep, platform=None):
+    cf = res[nbits-1]
+    pf = (cc_ndep & data[platform]['CondBitMasks']['G_CC_MASK_P'])[data[platform]['CondBitOffsets']['G_CC_SHIFT_P']]
+    af = (cc_ndep & data[platform]['CondBitMasks']['G_CC_MASK_A'])[data[platform]['CondBitOffsets']['G_CC_SHIFT_A']]
+    zf = (cc_ndep & data[platform]['CondBitMasks']['G_CC_MASK_Z'])[data[platform]['CondBitOffsets']['G_CC_SHIFT_Z']]
+    sf = (cc_ndep & data[platform]['CondBitMasks']['G_CC_MASK_S'])[data[platform]['CondBitOffsets']['G_CC_SHIFT_S']]
+    of = (res[nbits-1] ^ res[nbits-2])
+    return pc_make_rdata(data[platform]['size'], cf, pf, af, zf, sf, of, platform=platform)
+
+def pc_actions_UMUL(state, nbits, cc_dep1, cc_dep2, cc_ndep, platform=None):
+    lo = (cc_dep1 * cc_dep2)[nbits - 1:0]
+    rr = lo
+    hi = (rr >> nbits)[nbits - 1:0]
+    cf = state.se.If(hi != 0, state.se.BVV(1, 1), state.se.BVV(0, 1))
+    zf = calc_zerobit(state, lo)
+    pf = calc_paritybit(state, lo)
+    af = state.se.BVV(0, 1)
+    sf = lo[nbits - 1]
+    of = cf
+    return pc_make_rdata(data[platform]['size'], cf, pf, af, zf, sf, of, platform=platform)
+
 def pc_actions_UMULQ(*args, **kwargs):
     l.error("Unsupported flag action UMULQ")
     raise SimCCallError("Unsupported flag action. Please implement or bug Yan.")
+
 def pc_actions_SMUL(state, nbits, cc_dep1, cc_dep2, cc_ndep, platform=None):
     lo = (cc_dep1 * cc_dep2)[nbits - 1:0]
     rr = lo
@@ -395,6 +417,7 @@ def pc_actions_SMUL(state, nbits, cc_dep1, cc_dep2, cc_ndep, platform=None):
     sf = lo[nbits - 1]
     of = cf
     return pc_make_rdata(data[platform]['size'], cf, pf, af, zf, sf, of, platform=platform)
+
 def pc_actions_SMULQ(*args, **kwargs):
     l.error("Unsupported flag action SMULQ")
     raise SimCCallError("Unsupported flag action. Please implement or bug Yan.")
@@ -413,14 +436,7 @@ def pc_calculate_rdata_all_WRK(state, cc_op, cc_dep1_formal, cc_dep2_formal, cc_
 
     cc_str = data_inverted[platform]['OpTypes'][cc_op]
 
-    if cc_str.endswith('B'):
-        nbits = 8
-    elif cc_str.endswith('W'):
-        nbits = 16
-    elif cc_str.endswith('L'):
-        nbits = 32
-    elif cc_str.endswith('Q'):
-        nbits = 64
+    nbits = _get_nbits(cc_str)
     l.debug("nbits == %d", nbits)
 
     cc_dep1_formal = cc_dep1_formal[nbits-1:0]
@@ -629,28 +645,60 @@ each conditional flag, which greatly helps static analysis (like VSA).
 def _cond_flag(state, condition):
     return state.se.If(condition, state.se.BVV(1, 1), state.se.BVV(0, 1))
 
-# DEC
+# TODO: Implement the missing ones
 
-def pc_actions_DEC_CondZ(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l - 1 == 0)
+# General ops
+def pc_actions_op_SUB(arg_l, arg_r, cc_ndep):
+    return arg_l - arg_r
 
-# INC
+def pc_actions_op_DEC(arg_l, arg_r, cc_ndep):
+    return arg_l - 1
 
-def pc_actions_INC_CondNZ(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l + 1 != 0)
+def pc_actions_op_INC(arg_l, arg_r, cc_ndep):
+    return arg_l + 1
 
-# SHR
+def pc_actions_op_SHR(arg_l, arg_r, cc_ndep):
+    return arg_l >> arg_r
 
-def pc_actions_SHR_CondZ(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l >> arg_r == 0)
+def pc_actions_op_SHL(arg_l, arg_r, cc_ndep):
+    return arg_l << arg_r
 
-# ADD
+def pc_actions_op_ADD(arg_l, arg_r, cc_ndep):
+    return arg_l + arg_r
 
-# TODO: Implement them
+def pc_actions_op_LOGIC(arg_l, arg_r, cc_ndep):
+    return arg_l
 
-# SUB
+# General conditions
+def pc_actions_cond_CondZ(state, cc_expr):
+    return _cond_flag(state, cc_expr == 0)
+
+def pc_actions_cond_CondNZ(state, cc_expr):
+    return _cond_flag(state, cc_expr != 0)
+
+def pc_actions_cond_CondS(state, cc_expr):
+    return _cond_flag(state, state.se.SLT(cc_expr, 0))
+
+def pc_actions_cond_CondB(state, cc_expr):
+    return _cond_flag(state, state.se.ULT(cc_expr, 0))
+    
+def pc_actions_cond_CondBE(state, cc_expr):
+    return _cond_flag(state, state.se.ULE(cc_expr, 0))
+    
+def pc_actions_cond_CondNBE(state, cc_expr):
+    return _cond_flag(state, state.se.UGT(cc_expr, 0))
+
+def pc_actions_cond_CondL(state, cc_expr):
+    return _cond_flag(state, state.se.SLT(cc_expr, 0))
+    
+def pc_actions_cond_CondLE(state, cc_expr):
+    return _cond_flag(state, state.se.SLE(cc_expr, 0))
+    
+def pc_actions_cond_CondNLE(state, cc_expr):
+    return _cond_flag(state, state.se.SGT(cc_expr, 0))
 
 
+# Specialized versions of (op,cond) to make claripy happy
 def pc_actions_SUB_CondZ(state, arg_l, arg_r, cc_ndep):
     return _cond_flag(state, arg_l == arg_r)
 
@@ -667,30 +715,14 @@ def pc_actions_SUB_CondNBE(state, arg_l, arg_r, cc_ndep):
     return _cond_flag(state, state.se.UGT(arg_l, arg_r))
 
 def pc_actions_SUB_CondL(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l < arg_r)
+    return _cond_flag(state, state.se.SLT(arg_l, arg_r))
 
 def pc_actions_SUB_CondLE(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l <= arg_r)
+    return _cond_flag(state, state.se.SLE(arg_l, arg_r))
 
 def pc_actions_SUB_CondNLE(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l > arg_r)
+    return _cond_flag(state, state.se.SGT(arg_l, arg_r))
 
-def pc_actions_SUB_CondS(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l - arg_r < 0)
-
-# LOGIC
-
-def pc_actions_LOGIC_CondZ(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l == 0)
-
-def pc_actions_LOGIC_CondLE(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l <= arg_r)
-
-def pc_actions_LOGIC_CondNZ(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l != 0)
-
-def pc_actions_LOGIC_CondS(state, arg_l, arg_r, cc_ndep):
-    return _cond_flag(state, arg_l < 0)
 
 def pc_calculate_condition_simple(state, cond, cc_op, cc_dep1, cc_dep2, cc_ndep, platform=None):
     """
@@ -706,7 +738,14 @@ def pc_calculate_condition_simple(state, cond, cc_op, cc_dep1, cc_dep2, cc_ndep,
 
     # Extract the operation
     cc_op = flag_concretize(state, cc_op)
+    
+    if cc_op == data[platform]['OpTypes']['G_CC_OP_COPY']:
+        raise SimCCallError("G_CC_OP_COPY is not supported in pc_calculate_condition_simple(). Consider implementing.")
+    if cc_op == data[platform]['OpTypes']['G_CC_OP_NUMBER']:
+        raise SimCCallError("G_CC_OP_NUMBER is not supported in pc_calculate_condition_simple(). Consider implementing.")
+
     op = data_inverted[platform]['OpTypes'][cc_op]
+    nbits = _get_nbits(op)
     op = op[8 : -1]
 
     # Extract the condition
@@ -717,13 +756,25 @@ def pc_calculate_condition_simple(state, cond, cc_op, cc_dep1, cc_dep2, cc_ndep,
             cond = key
             break
 
+    cc_dep1_nbits = cc_dep1[nbits-1:0]
+    cc_dep2_nbits = cc_dep2[nbits-1:0]
+
+    # check for a specialized version first
     funcname = "pc_actions_%s_%s" % (op, cond)
     if funcname in globals():
-        r = globals()[funcname](state, cc_dep1, cc_dep2, cc_ndep)
-        return state.se.Concat(state.se.BVV(0, state.arch.bits - 1), r), []
+        r = globals()[funcname](state, cc_dep1_nbits, cc_dep2_nbits, cc_ndep)
+    else:
+        op_funcname = "pc_actions_op_%s" % op
+        cond_funcname = "pc_actions_cond_%s" % cond
+        if op_funcname in globals() and cond_funcname in globals():
+            cc_expr = globals()[op_funcname](cc_dep1_nbits, cc_dep2_nbits, cc_ndep)
+            r = globals()[cond_funcname](state, cc_expr)
+        else:
+            l.warning('Operation %s with condition %s is not supported in pc_calculate_condition_simple(). Consider implementing.', op, cond)
+            raise KeyError('Operation %s with condition %s not found.' % (op, cond))
+        
+    return state.se.Concat(state.se.BVV(0, state.arch.bits - 1), r), []
 
-    # TODO: Fallback to the complex-mode if the target method is not found.
-    raise Exception('%s not found.' % funcname)
 
 def pc_calculate_rdata_c(state, cc_op, cc_dep1, cc_dep2, cc_ndep, platform=None):
     cc_op = flag_concretize(state, cc_op)
@@ -746,9 +797,12 @@ def pc_calculate_rdata_c(state, cc_op, cc_dep1, cc_dep2, cc_ndep, platform=None)
 ###########################
 def amd64g_calculate_condition(state, cond, cc_op, cc_dep1, cc_dep2, cc_ndep):
     if USE_SIMPLIFIED_CCALLS in state.options:
-        return pc_calculate_condition_simple(state, cond, cc_op, cc_dep1, cc_dep2, cc_ndep, platform='AMD64')
-    else:
-        return pc_calculate_condition(state, cond, cc_op, cc_dep1, cc_dep2, cc_ndep, platform='AMD64')
+        try:
+            return pc_calculate_condition_simple(state, cond, cc_op, cc_dep1, cc_dep2, cc_ndep, platform='AMD64')
+        except KeyError:
+
+            pass
+    return pc_calculate_condition(state, cond, cc_op, cc_dep1, cc_dep2, cc_ndep, platform='AMD64')
 
 def amd64g_calculate_rflags_all(state, cc_op, cc_dep1, cc_dep2, cc_ndep):
     return pc_calculate_rdata_all(state, cc_op, cc_dep1, cc_dep2, cc_ndep, platform='AMD64')
@@ -1364,6 +1418,29 @@ def arm64g_calculate_condition(state, cond_n_op, cc_dep1, cc_dep2, cc_dep3):
     l.error("Unrecognized condition %d in arm64g_calculate_condition", concrete_cond)
     raise SimCCallError("Unrecognized condition %d in arm64g_calculate_condition" % concrete_cond)
 
+#
+# Some helpers
+#
+
+def _get_flags(state):
+    if state.arch.name == 'X86':
+        return x86g_calculate_eflags_all(state, state.regs.cc_op, state.regs.cc_dep1, state.regs.cc_dep2, state.regs.cc_ndep)
+    elif state.arch.name == 'AMD64':
+        return amd64g_calculate_rflags_all(state, state.regs.cc_op, state.regs.cc_dep1, state.regs.cc_dep2, state.regs.cc_ndep)
+    else:
+        l.warning("No such thing as a flags register for arch %s", state.arch.name)
+
+def _get_nbits(cc_str):
+    nbits = None
+    if cc_str.endswith('B'):
+        nbits = 8
+    elif cc_str.endswith('W'):
+        nbits = 16
+    elif cc_str.endswith('L'):
+        nbits = 32
+    elif cc_str.endswith('Q'):
+        nbits = 64
+    return nbits
 
 from ..s_errors import SimError, SimCCallError
 from ..s_options import USE_SIMPLIFIED_CCALLS

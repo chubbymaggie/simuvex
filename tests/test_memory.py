@@ -47,15 +47,11 @@ def test_copy():
     nose.tools.assert_equals(sorted(s.se.any_n_int(ret_x, 100)), range(10))
     nose.tools.assert_equals(sorted(s.se.any_n_str(result, 100, extra_constraints=[ret_x==3])), [ "ABCXX" ])
 
-## pylint: disable=R0904
-#@nose.tools.timed(10)
-def test_memory():
-    initial_memory = { 0: 'A', 1: 'A', 2: 'A', 3: 'A', 10: 'B' }
-    s = SimState(arch="AMD64", memory_backer=initial_memory, add_options={simuvex.o.REVERSE_MEMORY_NAME_MAP, simuvex.o.REVERSE_MEMORY_HASH_MAP})
-
+def _concrete_memory_tests(s):
     # Store a 4-byte variable to memory directly...
     s.memory.store(100, s.se.BVV(0x1337, 32))
     # ... then load it
+    print 'loading'
     expr = s.memory.load(100, 4)
     nose.tools.assert_is(expr, s.se.BVV(0x1337, 32))
     expr = s.memory.load(100, 2)
@@ -63,6 +59,45 @@ def test_memory():
     expr = s.memory.load(102, 2)
     nose.tools.assert_is(expr, s.se.BVV(0x1337, 16))
 
+    # partially symbolic
+    expr = s.memory.load(102, 4)
+    assert expr.length == 32
+    assert s.se.min(expr) == 0x13370000
+    assert s.se.max(expr) == 0x1337ffff
+
+    # partial overwrite
+    s.memory.store(101, s.se.BVV(0x1415, 16))
+    expr = s.memory.load(101, 3)
+    nose.tools.assert_is(expr, s.se.BVV(0x141537, 24))
+    expr = s.memory.load(100, 2)
+    assert s.se.min(expr) == 0x14
+    expr = s.memory.load(102, 2)
+    nose.tools.assert_is(expr, s.se.BVV(0x1537, 16))
+    expr = s.memory.load(102, 2, endness="Iend_LE")
+    nose.tools.assert_is(expr, s.se.BVV(0x3715, 16))
+
+    s.memory.store(0x100, s.se.BVV("AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"), endness="Iend_LE")
+    expr = s.memory.load(0x104, 13)
+    assert expr is s.se.BVV("GGGGFFFFEEEED")
+
+    # branching
+    s2 = s.copy()
+    s2a = s2.copy()
+    s2b = s2.copy()
+
+    s2a.memory.store(0x100, s.se.BVV("A"))
+    s2b.memory.store(0x100, s.se.BVV("B"))
+    assert s2b.memory.load(0x100, 1) is s.se.BVV("B")
+    assert s2a.memory.load(0x100, 1) is s.se.BVV("A")
+
+
+## pylint: disable=R0904
+#@nose.tools.timed(10)
+def test_memory():
+    initial_memory = { 0: 'A', 1: 'A', 2: 'A', 3: 'A', 10: 'B' }
+    s = SimState(arch="AMD64", memory_backer=initial_memory, add_options={simuvex.o.REVERSE_MEMORY_NAME_MAP, simuvex.o.REVERSE_MEMORY_HASH_MAP})
+
+    _concrete_memory_tests(s)
     # concrete address and partially symbolic result
     expr = s.memory.load(2, 4)
     expr = s.memory.load(2, 4)
@@ -265,7 +300,7 @@ def test_cased_store():
     #t = s.se.BVS('t', 32)
     s.memory.store_cases(0, [ s.se.BVV('AA'), s.se.BVV('AA'), s.se.BVV('AA') ], [ u == 0, u == 1, u == 2], fallback=s.se.BVV('XX'))
     r = s.memory.load(0, 2)
-    nose.tools.assert_equal(s.se.any_n_str(r, 3), ['AA', 'XX'])
+    nose.tools.assert_equal(sorted(s.se.any_n_str(r, 3)), ['AA', 'XX'])
 
     # and some identical values
     s = so.copy()
@@ -287,7 +322,7 @@ def test_abstract_memory():
     se = s.se
 
     def to_vs(region, offset):
-        return s.se.VS(region=region, bits=s.arch.bits, val=offset)
+        return s.se.VS(s.arch.bits, region, 0, offset)
 
     # Load a single-byte constant from global region
     expr = s.memory.load(to_vs('global', 2), 1)
@@ -407,7 +442,7 @@ def test_abstract_memory_find():
     s.memory.store(4, se.TSI(bits=64))
 
     def to_vs(region, offset):
-        return VS(region=region, bits=s.arch.bits, val=offset)
+        return VS(s.arch.bits, region, 0, offset)
 
     r, _, _ = s.memory.find(to_vs('global', 1), BVV(ord('A'), 8))
 
@@ -514,7 +549,7 @@ def test_concrete_memset():
     def _individual_test(state, base, val, size):
         # time it
         start = time.time()
-        memset = simuvex.SimProcedures['libc.so.6']['memset'](state, arguments=[base, state.se.BVV(val, 8), size])
+        memset = simuvex.SimProcedures['libc.so.6']['memset'](state, inline=True, arguments=[base, state.se.BVV(val, 8), size])
         elapsed = time.time() - start
 
         # should be done within 1 second
@@ -540,7 +575,59 @@ def test_concrete_memset():
     s = simuvex.SimState(arch='AMD64')
     _individual_test(s, BASE, VAL, SIZE)
 
+def test_false_condition():
+    s = simuvex.SimState(arch='AMD64')
+
+    asdf = s.se.BVV('asdf')
+    fdsa = s.se.BVV('fdsa')
+    s.memory.store(0x1000, asdf)
+    s.memory.store(0x1000, fdsa, condition=s.se.false)
+    s.memory.store(0, fdsa, condition=s.se.false)
+
+    assert s.memory.load(0x1000, 4) is asdf
+    assert 0 not in s.memory.mem._pages
+
+def test_paged_memory_membacker_equal_size():
+    membacker = {0: claripy.BVV(0, 8), 1: claripy.BVV(1, 8), 2: claripy.BVV(2, 8)}
+
+    simmem = simuvex.storage.SimPagedMemory(memory_backer=membacker, page_size=len(membacker))
+    simmem[0] #pylint:disable=pointless-statement
+
+def test_load_bytes():
+    s = simuvex.SimState(arch='AMD64')
+    asdf = s.se.BVS('asdf', 0x1000*8)
+    s.memory.store(0x4000, asdf)
+    the_bytes, missing, bytes_read = s.memory.mem.load_bytes(0x4000, 0x1000)
+    assert len(missing) == 0
+    assert len(the_bytes) == 1
+    assert bytes_read == 0x1000
+
+    fdsa = s.se.BVV('fdsa')
+    s.memory.store(0x4004, fdsa)
+    the_bytes, missing, bytes_read = s.memory.mem.load_bytes(0x4000, 0x1000)
+    assert len(missing) == 0
+    assert len(the_bytes) == 3
+    assert bytes_read == 0x1000
+
+    the_bytes, missing, bytes_read = s.memory.mem.load_bytes(0x8000, 0x2000)
+    assert len(the_bytes) == 0
+    assert len(missing) == 2
+    assert bytes_read == 0x2000
+
+def test_fast_memory():
+    s = simuvex.SimState(add_options={simuvex.o.FAST_REGISTERS, simuvex.o.FAST_MEMORY})
+
+    s.regs.rax = 0x4142434445464748
+    s.regs.rbx = 0x5555555544444444
+    assert (s.regs.rax == 0x4142434445464748).is_true()
+    assert (s.regs.rbx == 0x5555555544444444).is_true()
+
+    _concrete_memory_tests(s)
+
 if __name__ == '__main__':
+    test_fast_memory()
+    test_load_bytes()
+    test_false_condition()
     test_symbolic_write()
     test_fullpage_write()
     test_memory()
@@ -550,3 +637,4 @@ if __name__ == '__main__':
     test_abstract_memory_find()
     test_registers()
     test_concrete_memset()
+    test_paged_memory_membacker_equal_size()

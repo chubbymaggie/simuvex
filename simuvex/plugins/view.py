@@ -1,6 +1,9 @@
 import claripy
 from .plugin import SimStatePlugin
 
+import logging
+l = logging.getLogger('simuvex.plugins.view')
+
 class SimRegNameView(SimStatePlugin):
     def __init__(self):
         super(SimRegNameView, self).__init__()
@@ -8,7 +11,7 @@ class SimRegNameView(SimStatePlugin):
     def __getattr__(self, k):
         state = super(SimRegNameView, self).__getattribute__('state')
         try:
-            return state.registers.load(state.arch.registers[k][0], state.arch.registers[k][1])
+            return state.registers.load(k)
         except KeyError:
             return super(SimRegNameView, self).__getattribute__(k)
 
@@ -16,28 +19,27 @@ class SimRegNameView(SimStatePlugin):
         if k == 'state' or k in dir(SimStatePlugin):
             return object.__setattr__(self, k, v)
 
-        v = _raw_ast(v)
-        if not isinstance(v, claripy.Bits):
-            v = self.state.se.BVV(v, self.state.arch.registers[k][1]*8)
-
         try:
-            reg_offset = self.state.arch.registers[k][0]
+            return self.state.registers.store(k, v)
         except KeyError:
             raise AttributeError(k)
 
-        return self.state.registers.store(reg_offset, v)
-
     def __dir__(self):
+        if self.state.arch.name in ('X86', 'AMD64'):
+            return self.state.arch.registers.keys() + ['st%d' % n for n in xrange(8)] + ['tag%d' % n for n in xrange(8)]
         return self.state.arch.registers.keys()
 
     def copy(self):
         return SimRegNameView()
 
-    def merge(self, others, merge_flag, flag_values):
-        return False, [ ]
+    def merge(self, others, merge_conditions):
+        return False
 
-    def widen(self, others, merge_flag, flag_values):
-        return False, [ ]
+    def widen(self, others):
+        return False
+
+    def get(self, reg_name):
+        return self.__getattr__(reg_name)
 
 class SimMemView(SimStatePlugin):
     def __init__(self, ty=None, addr=None, state=None):
@@ -46,12 +48,6 @@ class SimMemView(SimStatePlugin):
         self._addr = addr
         if state is not None:
             self.set_state(state)
-
-    def __getstate__(self):
-        return {'type': self._type, 'addr': self._addr, 'state': self.state}
-
-    def __setstate__(self, data):
-        self.__init__(data['type'], data['addr'], data['state'])
 
     def set_state(self, state):
         super(SimMemView, self).set_state(state)
@@ -79,6 +75,8 @@ class SimMemView(SimStatePlugin):
                 raise ValueError("Slices with stop index are not supported")
             else:
                 addr = k.start
+        elif self._type is not None and self._type._can_refine_int:
+            return self._type._refine(self, k)
         else:
             addr = k
         return self._deeper(addr=addr)
@@ -90,9 +88,11 @@ class SimMemView(SimStatePlugin):
     state = None
 
     def __repr__(self):
+        if self._addr is None:
+            return '<SimMemView>'
         value = '<unresolvable>' if not self.resolvable else self.resolved
         addr = self._addr.__repr__(inner=True)
-        type_name = self._type.name if self._type is not None else '<untyped>'
+        type_name = repr(self._type) if self._type is not None else '<untyped>'
         return '<{} {} at {}>'.format(type_name,
                                       value,
                                       addr)
@@ -101,12 +101,12 @@ class SimMemView(SimStatePlugin):
         return self._type._refine_dir() if self._type else SimMemView.types.keys()
 
     def __getattr__(self, k):
-        if k in ('resolvable', 'resolved', 'state', '_addr', '_type') or k in dir(SimStatePlugin):
+        if k in ('deref', 'resolvable', 'resolved', 'state', '_addr', '_type') or k in dir(SimStatePlugin):
             return object.__getattribute__(self, k)
         if self._type:
             return self._type._refine(self, k)
         if k in SimMemView.types:
-            return self._deeper(ty=SimMemView.types[k](self.state.arch))
+            return self._deeper(ty=SimMemView.types[k].with_arch(self.state.arch))
         raise AttributeError(k)
 
     def __setattr__(self, k, v):
@@ -120,11 +120,11 @@ class SimMemView(SimStatePlugin):
     def copy(self):
         return SimMemView()
 
-    def merge(self, others, merge_flag, flag_values):
-        return False, [ ]
+    def merge(self, others, merge_conditions):
+        return False
 
-    def widen(self, others, merge_flag, flag_values):
-        return False, [ ]
+    def widen(self, others):
+        return False
 
     @property
     def resolvable(self):
@@ -135,6 +135,24 @@ class SimMemView(SimStatePlugin):
         if not self.resolvable:
             raise ValueError("Trying to resolve value without type and addr defined")
         return self._type.extract(self.state, self._addr)
+
+    @property
+    def concrete(self):
+        if not self.resolvable:
+            raise ValueError("Trying to resolve value without type and addr defined")
+        return self._type.extract(self.state, self._addr, True)
+
+    @property
+    def deref(self):
+        if self._addr is None:
+            raise ValueError("Trying to dereference pointer without addr defined")
+        ptr = self.state.memory.load(self._addr, self.state.arch.bytes, endness=self.state.arch.memory_endness)
+        if ptr.symbolic:
+            l.warn("Dereferencing symbolic pointer %s at %#x", repr(ptr), self.state.se.any_int(self._addr))
+            print self._addr
+        ptr = self.state.se.any_int(ptr)
+
+        return self._deeper(ty=None, addr=ptr)
 
     def store(self, value):
         if self._addr is None:
@@ -151,6 +169,5 @@ class SimMemView(SimStatePlugin):
 from ..s_type import ALL_TYPES
 SimMemView.types = ALL_TYPES # identity purposefully here
 
-from ..s_action_object import _raw_ast
 SimStatePlugin.register_default('regs', SimRegNameView)
 SimStatePlugin.register_default('mem', SimMemView)

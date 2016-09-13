@@ -6,6 +6,8 @@ l = logging.getLogger('simuvex.s_action')
 _noneset = frozenset()
 
 from .s_event import SimEvent
+
+
 class SimAction(SimEvent):
     """
     A SimAction represents a semantic action that an analyzed program performs.
@@ -29,8 +31,10 @@ class SimAction(SimEvent):
         if self.sim_procedure is not None:
             location = "%s()" % self.sim_procedure
         else:
-            location = "0x%x:%d" % (self.bbl_addr, self.stmt_idx)
-
+            if self.stmt_idx is not None:
+                location = "0x%x:%d" % (self.bbl_addr, self.stmt_idx)
+            else:
+                location = "0x%x" % self.bbl_addr
         return "<%s %s %s>" % (self.__class__.__name__, location, self._desc())
 
     def _desc(self):
@@ -85,6 +89,7 @@ class SimAction(SimEvent):
         """
         pass
 
+
 class SimActionExit(SimAction):
     """
     An Exit action represents a (possibly conditional) jump.
@@ -117,6 +122,7 @@ class SimActionExit(SimAction):
         c.target = self._copy_object(self.target)
         c.condition = self._copy_object(self.condition)
 
+
 class SimActionConstraint(SimAction):
     """
     A constraint action represents an extra constraint added during execution of a path.
@@ -142,6 +148,30 @@ class SimActionConstraint(SimAction):
             s += ' (cond)'
         return s
 
+
+class SimActionOperation(SimAction):
+    """
+    An action representing an operation between variables and/or constants.
+    """
+
+    def __init__(self, state, op, exprs):
+        super(SimActionOperation, self).__init__(state, 'operation')
+
+        self.op = op
+        self.exprs = exprs
+
+    @property
+    def all_objects(self):
+        return [ ex for ex in self.exprs if isinstance(ex, SimActionObject) ]
+
+    def _copy_objects(self, c):
+        c.op = self.op
+        c.exprs = self.exprs[::]
+
+    def _desc(self):
+        return "operation/%s" % (self.op)
+
+
 class SimActionData(SimAction):
     """
     A Data action represents a read or a write from memory, registers or a file.
@@ -150,8 +180,10 @@ class SimActionData(SimAction):
 
     READ = 'read'
     WRITE = 'write'
+    OPERATE = 'operate'
 
-    def __init__(self, state, region_type, action, tmp=None, addr=None, size=None, data=None, condition=None, fallback=None, fd=None):
+    def __init__(self, state, region_type, action, tmp=None, addr=None, size=None, data=None, condition=None,
+                 fallback=None, fd=None):
         super(SimActionData, self).__init__(state, region_type)
         self.action = action
 
@@ -159,7 +191,18 @@ class SimActionData(SimAction):
         self._tmp_dep = _noneset if tmp is None or action != SimActionData.READ else frozenset((tmp,))
 
         self.tmp = tmp
-        self.offset = addr if isinstance(addr, (int, long)) and region_type == 'reg' else None
+        self.offset = None
+        if region_type == 'reg':
+            if isinstance(addr, (int, long)):
+                self.offset = addr
+            else:
+                if addr.symbolic:
+                    # FIXME: we should fix it by allowing .offset taking ASTs instead of concretizing it right away
+                    l.warning('Concretizing a symbolic register offset in SimActionData.')
+                    self.offset = state.se.any_int(addr)
+                else:
+                    # it's not symbolic
+                    self.offset = state.se.exactly_int(addr)
         self.addr = self._make_object(addr)
         self.size = self._make_object(size)
         self.data = self._make_object(data)
